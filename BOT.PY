@@ -423,6 +423,11 @@ async def hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message[:4000])
 
 
+async def auto_hunt(context: ContextTypes.DEFAULT_TYPE):
+    # Scan automatically, but do NOT place trades.
+    # Keep execution manual until the scanner is tested.
+    pass
+
 # -------------------------
 # RUN BOT
 # -------------------------
@@ -435,6 +440,7 @@ def main():
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("analyse", analyse))
     app.add_handler(CommandHandler("hunt", hunt))
+
 
     print("Crypto Jarvis online")
 
