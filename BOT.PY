@@ -343,16 +343,16 @@ async def hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for candidate in candidates:
 
         # Hard filters before scoring
-        if candidate["market_cap"] < 500_000:
+        if candidate["market_cap"] < 100_000:
             continue
 
         if candidate["market_cap"] > 50_000_000:
             continue
 
-        if candidate["liquidity"] < 200_000:
+        if candidate["liquidity"] < 50_000:
             continue
 
-        if candidate["volume_24h"] < 250_000:
+        if candidate["volume_24h"] < 100_000:
             continue
 
         score, risk, risks = score_candidate(candidate)
