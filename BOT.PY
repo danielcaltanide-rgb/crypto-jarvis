@@ -424,17 +424,13 @@ async def hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def auto_hunt(context: ContextTypes.DEFAULT_TYPE):
-    # Scan automatically, but do NOT place trades.
-    # Keep execution manual until the scanner is tested.
-         bot = context.bot
+    bot = context.bot
     chat_id = context.job.chat_id
 
     await bot.send_message(
         chat_id=chat_id,
-        text="🔎 Jarvis auto-hunt scan running..."
-    )   
-
-# -------------------------
+        text="🔎 Jarvis auto-hunt scan running."
+    )
 # RUN BOT
 # -------------------------
 
