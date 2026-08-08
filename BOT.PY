@@ -426,7 +426,7 @@ async def hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def auto_hunt(context: ContextTypes.DEFAULT_TYPE):
     # Scan automatically, but do NOT place trades.
     # Keep execution manual until the scanner is tested.
-    pass
+    pass    
 
 # -------------------------
 # RUN BOT
