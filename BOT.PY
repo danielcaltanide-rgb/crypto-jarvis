@@ -1,9 +1,11 @@
-import json
+import os
 import asyncio
-import requests
-
-from pathlib import Path
+import json
+import time
 from datetime import datetime
+from pathlib import Path
+
+import requests
 
 from telegram import Update
 from telegram.ext import (
@@ -14,153 +16,107 @@ from telegram.ext import (
 
 
 # ============================================================
-# ENVIRONMENT
+# 1. ENVIRONMENT
 # ============================================================
 
-BOT_TOKEN = (
-    os.getenv("TELEGRAM_BOT_TOKEN")
-    or os.getenv("TELEGRAM_TOKEN")
-)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-if not BOT_TOKEN:
+if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError(
-        "Missing TELEGRAM_BOT_TOKEN in Railway."
+        "TELEGRAM_BOT_TOKEN is missing from Railway Variables."
     )
 
 
 # ============================================================
-# PAPER ACCOUNT
+# 2. BOT SETTINGS
 # ============================================================
 
 STARTING_BALANCE = 1000.00
 
-# Standard qualifying signal
-BASE_TRADE_SIZE = 20.00
+TRADE_SIZE = 20.00
 
-# Exceptional signal
-STRONG_TRADE_SIZE = 30.00
+# More selective configuration.
+MAX_OPEN_POSITIONS = 2
 
-MAX_OPEN_POSITIONS = 6
+ENTRY_SCORE = 72
+WATCH_SCORE = 60
 
-ENTRY_SCORE = 58
-STRONG_ENTRY_SCORE = 78
-
-WATCH_SCORE = 50
+SCAN_INTERVAL_SECONDS = 20
+MONITOR_INTERVAL_SECONDS = 8
 
 
 # ============================================================
-# DAILY TARGET / RISK
+# 3. MARKET FILTERS
 # ============================================================
 
-DAILY_PROFIT_TARGET = 100.00
+MIN_AGE_MINUTES = 2
+MAX_AGE_MINUTES = 180
 
-# Stop opening new trades after this loss.
-DAILY_MAX_LOSS = 75.00
+MIN_MARKET_CAP = 30_000
+MAX_MARKET_CAP = 2_000_000
 
-# Prevent endless overtrading.
-MAX_TRADES_PER_DAY = 30
+MIN_LIQUIDITY = 15_000
+MAX_LIQUIDITY = 800_000
 
+MIN_5M_VOLUME = 3_000
+MIN_5M_TRANSACTIONS = 12
 
-# ============================================================
-# SCANNER SPEED
-# ============================================================
+MIN_BUY_SELL_RATIO = 1.35
 
-SCAN_INTERVAL = 20
-MONITOR_INTERVAL = 8
-
-FIRST_SCAN_DELAY = 8
-FIRST_MONITOR_DELAY = 12
-
-
-# ============================================================
-# NEW / LOW-CAP FILTERS
-# ============================================================
-
-# Very young pairs are allowed.
-MIN_AGE_MINUTES = 1
-
-# Still a new-coin sniper.
-MAX_AGE_MINUTES = 240
-
-# Market cap may be unavailable/near-zero.
-MIN_MARKET_CAP = 0
-MAX_MARKET_CAP = 5_000_000
-
-# Very low liquidity allowed for PAPER experimentation.
-MIN_LIQUIDITY = 2_000
-MAX_LIQUIDITY = 1_500_000
-
-# Activity requirements.
-MIN_VOLUME_5M = 500
-MIN_TXNS_5M = 4
-
-# Anti-chase limits.
-MAX_PUMP_5M = 70.0
-MAX_PUMP_1H = 300.0
+# Avoid entering after a huge candle.
+MAX_5M_PRICE_CHANGE = 22.0
+MAX_1H_PRICE_CHANGE = 100.0
 
 
 # ============================================================
-# EXIT RULES
+# 4. PAPER EXIT RULES
 # ============================================================
 
-TAKE_PROFIT = 7.0
-STOP_LOSS = 4.0
+TAKE_PROFIT_PERCENT = 6.0
+STOP_LOSS_PERCENT = 3.0
 
-TRAIL_ACTIVATION = 4.0
-TRAIL_DISTANCE = 2.5
+TRAIL_START_PERCENT = 3.0
+TRAIL_DISTANCE_PERCENT = 2.0
 
 MAX_HOLD_MINUTES = 12
 
 
 # ============================================================
-# SIMULATED COSTS
+# 5. PAPER COST MODEL
 # ============================================================
 
-BASE_ENTRY_SLIPPAGE = 0.010
-BASE_EXIT_SLIPPAGE = 0.010
+ENTRY_SLIPPAGE = 0.01
+EXIT_SLIPPAGE = 0.01
 
 FEE_RATE = 0.003
 
-LOW_LIQ_EXTRA_SLIPPAGE = 0.015
-ULTRA_LOW_LIQ_EXTRA_SLIPPAGE = 0.030
+
+# ============================================================
+# 6. DAILY SAFETY RULES
+# ============================================================
+
+# Target only.
+DAILY_TARGET = 100.00
+
+DAILY_MAX_LOSS = 50.00
+
+MAX_TRADES_PER_DAY = 20
 
 
 # ============================================================
-# COOLDOWNS
+# 7. COOLDOWNS
 # ============================================================
 
-REENTRY_COOLDOWN = 20 * 60
-WATCH_COOLDOWN = 5 * 60
-
-
-# ============================================================
-# HTTP
-# ============================================================
-
-HTTP_TIMEOUT = 12
-
-session = requests.Session()
-
-session.headers.update(
-    {
-        "User-Agent":
-            "CaltanidePaperSniper/4.0"
-    }
-)
+REENTRY_COOLDOWN_SECONDS = 30 * 60
+WATCH_COOLDOWN_SECONDS = 5 * 60
 
 
 # ============================================================
-# STATE
+# 8. STATE
 # ============================================================
 
-STATE_FILE = Path(
-    os.getenv(
-        "STATE_FILE",
-        "paper_sniper_state.json",
-    )
-)
+STATE_FILE = Path("sniper_state.json")
 
 paper_cash = STARTING_BALANCE
 
@@ -168,70 +124,83 @@ positions = {}
 trade_history = []
 
 recent_entries = {}
-recent_watch_alerts = {}
+recent_alerts = {}
 
 known_addresses = {}
 
 last_scan_time = 0.0
-last_scan_candidates = 0
+last_scan_count = 0
 last_scan_best = None
-
-ADDRESS_MEMORY_SECONDS = 8 * 60 * 60
-MAX_KNOWN_ADDRESSES = 1000
+last_scan_error = "none"
 
 
 # ============================================================
-# DAILY STATE
+# 9. DAILY STATE
 # ============================================================
 
-daily_date = (
-    datetime.now()
-    .date()
-    .isoformat()
-)
+daily_date = datetime.now().date().isoformat()
 
-daily_realized_pnl = 0.0
-daily_trade_count = 0
-
+daily_pnl = 0.0
+daily_trades = 0
 daily_wins = 0
 daily_losses = 0
 
 
 # ============================================================
-# DISCOVERY ENDPOINTS
+# 10. HTTP
+# ============================================================
+
+HTTP_TIMEOUT = 15
+
+http = requests.Session()
+
+http.headers.update(
+    {
+        "User-Agent": "CaltanideJarvisPaperSniper/6.0"
+    }
+)
+
+
+# ============================================================
+# 11. DEXSCREENER DISCOVERY
 # ============================================================
 
 DISCOVERY_URLS = [
-    (
-        "https://api.dexscreener.com/"
-        "token-profiles/latest/v1"
-    ),
-    (
-        "https://api.dexscreener.com/"
-        "token-boosts/latest/v1"
-    ),
-    (
-        "https://api.dexscreener.com/"
-        "token-boosts/top/v1"
-    ),
-    (
-        "https://api.dexscreener.com/"
-        "community-takeovers/latest/v1"
-    ),
-    (
-        "https://api.dexscreener.com/"
-        "ads/latest/v1"
-    ),
+    "https://api.dexscreener.com/token-profiles/latest/v1",
+    "https://api.dexscreener.com/token-boosts/latest/v1",
+    "https://api.dexscreener.com/token-boosts/top/v1",
+    "https://api.dexscreener.com/community-takeovers/latest/v1",
+    "https://api.dexscreener.com/ads/latest/v1",
 ]
+
+ADDRESS_MEMORY_SECONDS = 6 * 60 * 60
+MAX_KNOWN_ADDRESSES = 600
 
 
 # ============================================================
-# HELPERS
+# 12. SAFE CONVERSION HELPERS
+# ============================================================
+
+def fnum(value, default=0.0):
+    try:
+        return float(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def inum(value, default=0):
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+# ============================================================
+# 13. HTTP HELPER
 # ============================================================
 
 def get_json(url):
-
-    response = session.get(
+    response = http.get(
         url,
         timeout=HTTP_TIMEOUT,
     )
@@ -242,146 +211,83 @@ def get_json(url):
 
 
 def chunks(items, size):
-
-    for i in range(
-        0,
-        len(items),
-        size,
-    ):
-
-        yield items[
-            i:i + size
-        ]
+    for index in range(0, len(items), size):
+        yield items[index:index + size]
 
 
 # ============================================================
-# DAILY RESET
+# 14. DAILY RESET
 # ============================================================
 
-def reset_daily_stats_if_needed():
+def reset_daily_if_needed():
 
     global daily_date
-    global daily_realized_pnl
-    global daily_trade_count
+    global daily_pnl
+    global daily_trades
     global daily_wins
     global daily_losses
 
-    today = (
-        datetime.now()
-        .date()
-        .isoformat()
-    )
+    today = datetime.now().date().isoformat()
 
     if today == daily_date:
         return
 
     daily_date = today
 
-    daily_realized_pnl = 0.0
-    daily_trade_count = 0
-
+    daily_pnl = 0.0
+    daily_trades = 0
     daily_wins = 0
     daily_losses = 0
 
     save_state()
 
 
-def trading_allowed():
+# ============================================================
+# 15. DAILY TRADING STATUS
+# ============================================================
 
-    reset_daily_stats_if_needed()
+def trading_status():
 
-    if (
-        daily_realized_pnl
-        >= DAILY_PROFIT_TARGET
-    ):
-        return (
-            False,
-            "🎯 DAILY PROFIT TARGET REACHED",
-        )
+    reset_daily_if_needed()
 
-    if (
-        daily_realized_pnl
-        <= -DAILY_MAX_LOSS
-    ):
-        return (
-            False,
-            "🛑 DAILY LOSS LIMIT REACHED",
-        )
+    if daily_pnl >= DAILY_TARGET:
+        return False, "TARGET REACHED"
 
-    if (
-        daily_trade_count
-        >= MAX_TRADES_PER_DAY
-    ):
-        return (
-            False,
-            "🛑 DAILY TRADE LIMIT REACHED",
-        )
+    if daily_pnl <= -DAILY_MAX_LOSS:
+        return False, "LOSS LIMIT REACHED"
 
-    return (
-        True,
-        "🟢 ACTIVE",
-    )
+    if daily_trades >= MAX_TRADES_PER_DAY:
+        return False, "TRADE LIMIT REACHED"
+
+    return True, "ACTIVE"
 
 
 # ============================================================
-# PERSISTENCE
+# 16. PERSISTENCE
 # ============================================================
 
 def save_state():
 
-    state = {
-        "paper_cash":
-            paper_cash,
+    data = {
+        "paper_cash": paper_cash,
+        "positions": positions,
+        "trade_history": trade_history,
+        "recent_entries": recent_entries,
 
-        "positions":
-            positions,
-
-        "trade_history":
-            trade_history,
-
-        "recent_entries":
-            recent_entries,
-
-        "daily_date":
-            daily_date,
-
-        "daily_realized_pnl":
-            daily_realized_pnl,
-
-        "daily_trade_count":
-            daily_trade_count,
-
-        "daily_wins":
-            daily_wins,
-
-        "daily_losses":
-            daily_losses,
+        "daily_date": daily_date,
+        "daily_pnl": daily_pnl,
+        "daily_trades": daily_trades,
+        "daily_wins": daily_wins,
+        "daily_losses": daily_losses,
     }
 
     try:
-
-        temp = Path(
-            str(STATE_FILE)
-            + ".tmp"
-        )
-
-        temp.write_text(
-            json.dumps(
-                state,
-                indent=2,
-            )
-        )
-
-        temp.replace(
-            STATE_FILE
+        STATE_FILE.write_text(
+            json.dumps(data, indent=2)
         )
 
     except Exception as error:
-
-        print(
-            "save_state:",
-            repr(error),
-        )
+        print("save_state error:", repr(error))
 
 
 def load_state():
@@ -392,8 +298,8 @@ def load_state():
     global recent_entries
 
     global daily_date
-    global daily_realized_pnl
-    global daily_trade_count
+    global daily_pnl
+    global daily_trades
     global daily_wins
     global daily_losses
 
@@ -401,119 +307,84 @@ def load_state():
         return
 
     try:
-
-        state = json.loads(
+        data = json.loads(
             STATE_FILE.read_text()
         )
 
-        paper_cash = float(
-            state.get(
-                "paper_cash",
-                STARTING_BALANCE,
-            )
+        paper_cash = fnum(
+            data.get("paper_cash"),
+            STARTING_BALANCE,
         )
 
-        positions = state.get(
+        positions = data.get(
             "positions",
             {},
         )
 
-        trade_history = state.get(
+        trade_history = data.get(
             "trade_history",
             [],
         )
 
-        recent_entries = state.get(
+        recent_entries = data.get(
             "recent_entries",
             {},
         )
 
-        daily_date = state.get(
+        daily_date = data.get(
             "daily_date",
             daily_date,
         )
 
-        daily_realized_pnl = float(
-            state.get(
-                "daily_realized_pnl",
-                0,
-            )
+        daily_pnl = fnum(
+            data.get("daily_pnl")
         )
 
-        daily_trade_count = int(
-            state.get(
-                "daily_trade_count",
-                0,
-            )
+        daily_trades = inum(
+            data.get("daily_trades")
         )
 
-        daily_wins = int(
-            state.get(
-                "daily_wins",
-                0,
-            )
+        daily_wins = inum(
+            data.get("daily_wins")
         )
 
-        daily_losses = int(
-            state.get(
-                "daily_losses",
-                0,
-            )
+        daily_losses = inum(
+            data.get("daily_losses")
         )
 
-        reset_daily_stats_if_needed()
+        reset_daily_if_needed()
 
-        print(
-            "Paper sniper state loaded."
-        )
+        print("Paper state loaded.")
 
     except Exception as error:
-
-        print(
-            "load_state:",
-            repr(error),
-        )
+        print("load_state error:", repr(error))
 
 
 # ============================================================
-# ADDRESS DISCOVERY
+# 17. CLEAN TOKEN MEMORY
 # ============================================================
 
-def cleanup_addresses():
+def clean_known_addresses():
 
     now = time.time()
 
-    expired = [
-        address
-        for address, timestamp
-        in known_addresses.items()
-        if (
-            now - timestamp
-            > ADDRESS_MEMORY_SECONDS
-        )
-    ]
+    expired = []
+
+    for address, seen_at in known_addresses.items():
+
+        if now - seen_at > ADDRESS_MEMORY_SECONDS:
+            expired.append(address)
 
     for address in expired:
+        known_addresses.pop(address, None)
 
-        known_addresses.pop(
-            address,
-            None,
-        )
-
-    if (
-        len(known_addresses)
-        > MAX_KNOWN_ADDRESSES
-    ):
+    if len(known_addresses) > MAX_KNOWN_ADDRESSES:
 
         newest = sorted(
             known_addresses.items(),
-            key=lambda x: x[1],
+            key=lambda item: item[1],
             reverse=True,
-        )
-
-        newest = newest[
-            :MAX_KNOWN_ADDRESSES
-        ]
+        )[:MAX_KNOWN_ADDRESSES]
 
         known_addresses.clear()
 
@@ -522,6 +393,10 @@ def cleanup_addresses():
         )
 
 
+# ============================================================
+# 18. DISCOVER SOLANA TOKENS
+# ============================================================
+
 def discover_addresses():
 
     now = time.time()
@@ -529,46 +404,32 @@ def discover_addresses():
     for url in DISCOVERY_URLS:
 
         try:
-
-            data = get_json(
-                url
-            )
+            data = get_json(url)
 
         except Exception as error:
-
             print(
-                "discovery:",
+                "discovery error:",
+                url,
                 repr(error),
             )
-
             continue
 
-        if not isinstance(
-            data,
-            list,
-        ):
+        if not isinstance(data, list):
             continue
 
         for item in data:
 
-            if (
-                item.get("chainId")
-                != "solana"
-            ):
+            if item.get("chainId") != "solana":
                 continue
 
-            address = (
-                item.get("tokenAddress")
-            )
+            address = item.get("tokenAddress")
 
             if not address:
                 continue
 
-            known_addresses[
-                address
-            ] = now
+            known_addresses[address] = now
 
-    cleanup_addresses()
+    clean_known_addresses()
 
     return list(
         known_addresses.keys()
@@ -576,24 +437,20 @@ def discover_addresses():
 
 
 # ============================================================
-# FETCH BEST POOLS
+# 19. GET DEX PAIRS
 # ============================================================
 
 def fetch_best_pairs():
 
-    addresses = (
-        discover_addresses()
-    )
+    addresses = discover_addresses()
 
     if not addresses:
         return {}
 
     all_pairs = []
 
-    for batch in chunks(
-        addresses,
-        30,
-    ):
+    # DEX Screener supports up to 30 addresses in this endpoint.
+    for batch in chunks(addresses, 30):
 
         url = (
             "https://api.dexscreener.com/"
@@ -602,272 +459,135 @@ def fetch_best_pairs():
         )
 
         try:
-
-            data = get_json(
-                url
-            )
+            result = get_json(url)
 
         except Exception as error:
-
             print(
-                "pair fetch:",
+                "pair fetch error:",
                 repr(error),
             )
-
             continue
 
-        if isinstance(
-            data,
-            list,
-        ):
+        if isinstance(result, list):
+            all_pairs.extend(result)
 
-            all_pairs.extend(
-                data
-            )
-
-    best = {}
+    best_pairs = {}
 
     for pair in all_pairs:
 
-        if (
-            pair.get("chainId")
-            != "solana"
-        ):
+        if pair.get("chainId") != "solana":
             continue
 
-        base = (
-            pair.get("baseToken")
-            or {}
-        )
+        base = pair.get("baseToken") or {}
 
-        address = (
-            base.get("address")
-        )
+        address = base.get("address")
 
         if not address:
             continue
 
-        liquidity = float(
-            (
-                (
-                    pair.get("liquidity")
-                    or {}
-                ).get("usd")
-            )
-            or 0
+        liquidity = fnum(
+            (pair.get("liquidity") or {}).get("usd")
         )
 
-        previous = best.get(
-            address
-        )
+        previous = best_pairs.get(address)
 
         if previous is None:
-
-            best[
-                address
-            ] = pair
-
+            best_pairs[address] = pair
             continue
 
-        previous_liquidity = float(
-            (
-                (
-                    previous.get(
-                        "liquidity"
-                    )
-                    or {}
-                ).get("usd")
-            )
-            or 0
+        previous_liquidity = fnum(
+            (previous.get("liquidity") or {}).get("usd")
         )
 
-        if (
-            liquidity
-            > previous_liquidity
-        ):
+        if liquidity > previous_liquidity:
+            best_pairs[address] = pair
 
-            best[
-                address
-            ] = pair
-
-    return best
+    return best_pairs
 
 
 # ============================================================
-# NORMALIZE PAIR
+# 20. NORMALIZE MARKET DATA
 # ============================================================
 
-def normalize_pair(
-    address,
-    pair,
-):
+def normalize_pair(address, pair):
 
-    base = (
-        pair.get("baseToken")
-        or {}
-    )
+    base = pair.get("baseToken") or {}
 
-    volume = (
-        pair.get("volume")
-        or {}
-    )
+    volume = pair.get("volume") or {}
 
-    changes = (
-        pair.get("priceChange")
-        or {}
-    )
+    changes = pair.get("priceChange") or {}
 
-    txns = (
-        pair.get("txns")
-        or {}
-    )
+    transactions = pair.get("txns") or {}
 
-    tx5 = (
-        txns.get("m5")
-        or {}
-    )
+    five_minute_txns = transactions.get("m5") or {}
 
-    created = (
-        pair.get("pairCreatedAt")
-    )
+    created = pair.get("pairCreatedAt")
 
     if not created:
         return None
 
     try:
-
-        age = (
+        age_minutes = (
             int(time.time() * 1000)
             - int(created)
-        ) / 60000
+        ) / 60_000
 
     except Exception:
-
         return None
 
-    if age < 0:
+    if age_minutes < 0:
         return None
-
-    try:
-
-        price = float(
-            pair.get("priceUsd")
-            or 0
-        )
-
-    except Exception:
-
-        price = 0
 
     return {
-        "address":
-            address,
+        "address": address,
 
-        "name":
-            base.get("name")
-            or "Unknown",
+        "name": base.get("name") or "Unknown",
 
-        "symbol":
-            base.get("symbol")
-            or "?",
+        "symbol": base.get("symbol") or "?",
 
-        "price":
-            price,
+        "price": fnum(
+            pair.get("priceUsd")
+        ),
 
-        "age":
-            age,
+        "age": age_minutes,
 
-        "market_cap":
-            float(
-                pair.get("marketCap")
-                or pair.get("fdv")
-                or 0
-            ),
+        "market_cap": fnum(
+            pair.get("marketCap")
+            or pair.get("fdv")
+        ),
 
-        "liquidity":
-            float(
-                (
-                    (
-                        pair.get(
-                            "liquidity"
-                        )
-                        or {}
-                    ).get("usd")
-                )
-                or 0
-            ),
+        "liquidity": fnum(
+            (pair.get("liquidity") or {}).get("usd")
+        ),
 
-        "volume_5m":
-            float(
-                volume.get("m5")
-                or 0
-            ),
+        "volume_5m": fnum(
+            volume.get("m5")
+        ),
 
-        "volume_1h":
-            float(
-                volume.get("h1")
-                or 0
-            ),
+        "volume_1h": fnum(
+            volume.get("h1")
+        ),
 
-        "buys_5m":
-            int(
-                tx5.get("buys")
-                or 0
-            ),
+        "buys_5m": inum(
+            five_minute_txns.get("buys")
+        ),
 
-        "sells_5m":
-            int(
-                tx5.get("sells")
-                or 0
-            ),
+        "sells_5m": inum(
+            five_minute_txns.get("sells")
+        ),
 
-        "change_5m":
-            float(
-                changes.get("m5")
-                or 0
-            ),
+        "change_5m": fnum(
+            changes.get("m5")
+        ),
 
-        "change_1h":
-            float(
-                changes.get("h1")
-                or 0
-            ),
+        "change_1h": fnum(
+            changes.get("h1")
+        ),
     }
 
 
 # ============================================================
-# RISK LABEL
-# ============================================================
-
-def risk_label(c):
-
-    if (
-        c["market_cap"]
-        < 25_000
-        or c["liquidity"]
-        < 5_000
-    ):
-        return "☢️ ULTRA"
-
-    if (
-        c["market_cap"]
-        < 75_000
-        or c["liquidity"]
-        < 15_000
-    ):
-        return "🔴 EXTREME"
-
-    if (
-        c["market_cap"]
-        < 250_000
-    ):
-        return "🟠 VERY HIGH"
-
-    return "🟡 HIGH"
-
-
-# ============================================================
-# SCORE TOKEN
+# 21. SCORE TOKEN
 # ============================================================
 
 def score_token(c):
@@ -875,258 +595,172 @@ def score_token(c):
     reasons = []
     risks = []
 
+    # ---------------------------
+    # HARD FILTERS
+    # ---------------------------
+
     if c["price"] <= 0:
-        return 0, reasons, risks
+        return 0, reasons, ["no price"]
 
     if not (
         MIN_AGE_MINUTES
         <= c["age"]
         <= MAX_AGE_MINUTES
     ):
-        return 0, reasons, risks
+        return 0, reasons, ["age"]
 
-    if (
-        c["market_cap"]
-        > MAX_MARKET_CAP
+    if not (
+        MIN_MARKET_CAP
+        <= c["market_cap"]
+        <= MAX_MARKET_CAP
     ):
-        return 0, reasons, risks
+        return 0, reasons, ["market cap"]
 
     if not (
         MIN_LIQUIDITY
         <= c["liquidity"]
         <= MAX_LIQUIDITY
     ):
-        return 0, reasons, risks
+        return 0, reasons, ["liquidity"]
 
-    if (
-        c["volume_5m"]
-        < MIN_VOLUME_5M
-    ):
-        return 0, reasons, risks
+    if c["volume_5m"] < MIN_5M_VOLUME:
+        return 0, reasons, ["volume"]
 
     tx_count = (
         c["buys_5m"]
         + c["sells_5m"]
     )
 
-    if (
-        tx_count
-        < MIN_TXNS_5M
-    ):
-        return 0, reasons, risks
+    if tx_count < MIN_5M_TRANSACTIONS:
+        return 0, reasons, ["transactions"]
 
-    if (
-        c["change_5m"]
-        > MAX_PUMP_5M
-    ):
-        return 0, reasons, risks
+    if c["change_5m"] > MAX_5M_PRICE_CHANGE:
+        return 0, reasons, ["5m pump too high"]
 
-    if (
-        c["change_1h"]
-        > MAX_PUMP_1H
-    ):
-        return 0, reasons, risks
+    if c["change_1h"] > MAX_1H_PRICE_CHANGE:
+        return 0, reasons, ["1h pump too high"]
+
+    buys = c["buys_5m"]
+    sells = c["sells_5m"]
+
+    if sells > 0:
+
+        buy_sell_ratio = buys / sells
+
+        if buy_sell_ratio < MIN_BUY_SELL_RATIO:
+            return (
+                0,
+                reasons,
+                ["buy pressure too weak"],
+            )
+
+    # ---------------------------
+    # SCORE
+    # ---------------------------
 
     score = 0
 
+    # Freshness
 
-    # AGE
-
-    if c["age"] <= 5:
-
-        score += 18
-        reasons.append(
-            "brand new"
-        )
-
-    elif c["age"] <= 15:
-
+    if c["age"] <= 10:
         score += 15
-        reasons.append(
-            "very fresh"
-        )
+        reasons.append("very fresh")
 
-    elif c["age"] <= 45:
+    elif c["age"] <= 30:
+        score += 12
+        reasons.append("fresh")
 
-        score += 11
-
-    elif c["age"] <= 120:
-
-        score += 6
+    elif c["age"] <= 60:
+        score += 8
 
     else:
+        score += 4
 
-        score += 2
+    # Market cap
 
+    market_cap = c["market_cap"]
 
-    # MARKET CAP
-
-    mc = c["market_cap"]
-
-    if mc <= 0:
-
-        score += 2
-        risks.append(
-            "MC unavailable"
-        )
-
-    elif mc < 25_000:
-
-        score += 11
-        risks.append(
-            "ultra micro cap"
-        )
-
-    elif mc < 75_000:
-
-        score += 14
-        reasons.append(
-            "very low cap"
-        )
-
-    elif mc < 250_000:
-
+    if 50_000 <= market_cap <= 350_000:
         score += 15
-        reasons.append(
-            "micro cap"
-        )
+        reasons.append("micro-cap zone")
 
-    elif mc < 1_000_000:
-
+    elif market_cap <= 750_000:
         score += 11
 
-    else:
-
-        score += 5
-
-
-    # LIQUIDITY
-
-    liquidity = c[
-        "liquidity"
-    ]
-
-    if liquidity < 5_000:
-
-        score += 2
-        risks.append(
-            "very thin liquidity"
-        )
-
-    elif liquidity < 10_000:
-
-        score += 6
-        risks.append(
-            "thin liquidity"
-        )
-
-    elif liquidity < 30_000:
-
-        score += 11
-
-    elif liquidity <= 250_000:
-
-        score += 16
-        reasons.append(
-            "good liquidity"
-        )
-
-    else:
-
-        score += 9
-
-
-    # VOLUME
-
-    volume5 = c[
-        "volume_5m"
-    ]
-
-    if volume5 >= 100_000:
-
-        score += 18
-        reasons.append(
-            "explosive volume"
-        )
-
-    elif volume5 >= 30_000:
-
-        score += 15
-        reasons.append(
-            "very strong volume"
-        )
-
-    elif volume5 >= 10_000:
-
-        score += 11
-
-    elif volume5 >= 3_000:
-
+    elif market_cap <= 1_500_000:
         score += 7
 
     else:
-
         score += 3
 
+    # Liquidity
 
-    # VOLUME ACCELERATION
+    liquidity = c["liquidity"]
 
-    volume1h = c[
-        "volume_1h"
-    ]
+    if 30_000 <= liquidity <= 200_000:
+        score += 17
+        reasons.append("healthy liquidity")
 
-    if volume1h > 0:
+    elif liquidity >= 20_000:
+        score += 12
 
-        baseline = (
-            volume1h / 12
+    else:
+        score += 5
+        risks.append("lower liquidity")
+
+    # Volume
+
+    volume_5m = c["volume_5m"]
+
+    if volume_5m >= 50_000:
+        score += 16
+        reasons.append("strong volume")
+
+    elif volume_5m >= 20_000:
+        score += 13
+
+    elif volume_5m >= 8_000:
+        score += 9
+
+    else:
+        score += 5
+
+    # Volume acceleration
+
+    if c["volume_1h"] > 0:
+
+        normal_five_minute_volume = (
+            c["volume_1h"] / 12
         )
 
-        if baseline > 0:
+        if normal_five_minute_volume > 0:
 
-            accel = (
-                volume5 / baseline
+            acceleration = (
+                volume_5m
+                / normal_five_minute_volume
             )
 
-            if accel >= 5:
-
-                score += 16
+            if acceleration >= 4:
+                score += 15
                 reasons.append(
-                    "volume exploding"
+                    "volume acceleration"
                 )
 
-            elif accel >= 3:
+            elif acceleration >= 2:
+                score += 11
 
-                score += 13
-                reasons.append(
-                    "volume accelerating"
-                )
+            elif acceleration >= 1.25:
+                score += 6
 
-            elif accel >= 1.5:
-
-                score += 8
-
-            elif accel < 0.5:
-
-                score -= 7
+            elif acceleration < 0.6:
+                score -= 8
                 risks.append(
                     "volume fading"
                 )
 
+    # Buy pressure
 
-    # BUY PRESSURE
-
-    buys = c[
-        "buys_5m"
-    ]
-
-    sells = c[
-        "sells_5m"
-    ]
-
-    if (
-        sells == 0
-        and buys >= 6
-    ):
+    if sells == 0 and buys >= 10:
 
         score += 16
         reasons.append(
@@ -1135,153 +769,99 @@ def score_token(c):
 
     elif sells > 0:
 
-        ratio = (
-            buys / sells
-        )
+        ratio = buys / sells
 
-        if ratio >= 4:
-
-            score += 18
+        if ratio >= 3:
+            score += 17
             reasons.append(
                 "extreme buy pressure"
             )
 
-        elif ratio >= 2.5:
-
-            score += 15
+        elif ratio >= 2:
+            score += 14
             reasons.append(
                 "strong buy pressure"
             )
 
         elif ratio >= 1.5:
+            score += 9
 
-            score += 10
+        else:
+            score += 4
 
-        elif ratio >= 1.1:
+    # Momentum
 
-            score += 5
+    move = c["change_5m"]
 
-        elif ratio < 0.7:
-
-            score -= 15
-            risks.append(
-                "heavy selling"
-            )
-
-
-    # MOMENTUM
-
-    move = c[
-        "change_5m"
-    ]
-
-    if 1 <= move <= 10:
-
+    if 1 <= move <= 7:
         score += 14
         reasons.append(
             "early momentum"
         )
 
-    elif 10 < move <= 25:
-
+    elif 7 < move <= 12:
         score += 10
 
-    elif 25 < move <= 45:
-
-        score += 4
+    elif 12 < move <= 18:
+        score += 5
         risks.append(
-            "fast move"
+            "already moving"
         )
 
-    elif move > 45:
-
-        score -= 7
+    elif move > 18:
+        score -= 8
         risks.append(
-            "late entry risk"
+            "late-entry risk"
         )
 
-    elif move < -5:
+    elif move < 0:
+        score -= 5
 
-        score -= 15
-        risks.append(
-            "falling"
+    # Liquidity / market cap ratio
+
+    if market_cap > 0:
+
+        liquidity_ratio = (
+            liquidity
+            / market_cap
         )
 
-
-    # LIQUIDITY / MARKET CAP
-
-    if (
-        mc > 0
-        and liquidity > 0
-    ):
-
-        ratio = (
-            liquidity / mc
-        )
-
-        if ratio >= 0.30:
-
+        if liquidity_ratio >= 0.25:
             score += 10
             reasons.append(
                 "strong liquidity ratio"
             )
 
-        elif ratio >= 0.15:
+        elif liquidity_ratio >= 0.12:
+            score += 6
 
-            score += 7
-
-        elif ratio >= 0.07:
-
-            score += 3
-
-        elif ratio < 0.025:
-
+        elif liquidity_ratio < 0.04:
             score -= 12
             risks.append(
                 "weak liquidity ratio"
             )
 
-
-    # ACTIVITY
-
-    if buys >= 100:
-
-        score += 7
-
-    elif buys >= 30:
-
-        score += 4
-
-
-    return (
-        max(
-            0,
-            min(
-                score,
-                100,
-            ),
-        ),
-        reasons,
-        risks,
+    score = max(
+        0,
+        min(score, 100),
     )
+
+    return score, reasons, risks
 
 
 # ============================================================
-# RANKINGS
+# 22. RANK CANDIDATES
 # ============================================================
 
 def get_rankings():
 
     pairs = fetch_best_pairs()
 
+    results = []
+
     now = time.time()
 
-    ranked = []
-
-    for (
-        address,
-        pair,
-    ) in pairs.items():
+    for address, pair in pairs.items():
 
         candidate = normalize_pair(
             address,
@@ -1294,328 +874,170 @@ def get_rankings():
         if address in positions:
             continue
 
-        last_entry = (
-            recent_entries.get(
-                address,
-                0,
-            )
+        last_entry = fnum(
+            recent_entries.get(address)
         )
 
         if (
             last_entry
-            and (
-                now - last_entry
-            )
-            < REENTRY_COOLDOWN
+            and now - last_entry
+            < REENTRY_COOLDOWN_SECONDS
         ):
             continue
 
-        (
-            score,
-            reasons,
-            risks,
-        ) = score_token(
+        score, reasons, risks = score_token(
             candidate
         )
 
-        if score < 35:
+        if score < WATCH_SCORE:
             continue
 
-        candidate[
-            "score"
-        ] = score
+        candidate["score"] = score
+        candidate["reasons"] = reasons
+        candidate["risks"] = risks
 
-        candidate[
-            "reasons"
-        ] = reasons
+        results.append(candidate)
 
-        candidate[
-            "risks"
-        ] = risks
-
-        candidate[
-            "risk"
-        ] = risk_label(
-            candidate
-        )
-
-        ranked.append(
-            candidate
-        )
-
-    ranked.sort(
-        key=lambda x: (
-            x["score"],
-            x["volume_5m"],
-            x["buys_5m"],
-            x["liquidity"],
+    results.sort(
+        key=lambda token: (
+            token["score"],
+            token["volume_5m"],
+            token["buys_5m"],
+            token["liquidity"],
         ),
         reverse=True,
     )
 
-    return ranked
+    return results
 
 
 # ============================================================
-# CURRENT TOKEN QUOTE
+# 23. GET CURRENT TOKEN PRICE
 # ============================================================
 
-def current_quote(
-    address,
-):
+def get_current_quote(address):
 
-    data = get_json(
-        (
-            "https://api.dexscreener.com/"
-            "token-pairs/v1/solana/"
-            f"{address}"
-        )
+    url = (
+        "https://api.dexscreener.com/"
+        "token-pairs/v1/solana/"
+        f"{address}"
     )
 
-    if (
-        not isinstance(
-            data,
-            list,
-        )
-        or not data
-    ):
+    result = get_json(url)
+
+    if not isinstance(result, list):
         return None
 
-    pair = max(
-        data,
-        key=lambda p:
-            float(
-                (
-                    (
-                        p.get(
-                            "liquidity"
-                        )
-                        or {}
-                    ).get("usd")
-                )
-                or 0
-            ),
-    )
-
-    try:
-
-        price = float(
-            pair.get("priceUsd")
-            or 0
-        )
-
-    except Exception:
-
+    if not result:
         return None
 
-    liquidity = float(
-        (
-            (
-                pair.get(
-                    "liquidity"
-                )
-                or {}
-            ).get("usd")
-        )
-        or 0
+    best_pair = max(
+        result,
+        key=lambda pair: fnum(
+            (pair.get("liquidity") or {}).get("usd")
+        ),
     )
+
+    price = fnum(
+        best_pair.get("priceUsd")
+    )
+
+    liquidity = fnum(
+        (best_pair.get("liquidity") or {}).get("usd")
+    )
+
+    if price <= 0:
+        return None
 
     return {
-        "price":
-            price,
-
-        "liquidity":
-            liquidity,
+        "price": price,
+        "liquidity": liquidity,
     }
 
 
 # ============================================================
-# SLIPPAGE
+# 24. OPEN PAPER TRADE
 # ============================================================
 
-def entry_slippage(
-    liquidity,
-):
-
-    if liquidity < 5_000:
-
-        return (
-            BASE_ENTRY_SLIPPAGE
-            + ULTRA_LOW_LIQ_EXTRA_SLIPPAGE
-        )
-
-    if liquidity < 15_000:
-
-        return (
-            BASE_ENTRY_SLIPPAGE
-            + LOW_LIQ_EXTRA_SLIPPAGE
-        )
-
-    if liquidity < 30_000:
-
-        return (
-            BASE_ENTRY_SLIPPAGE
-            + 0.008
-        )
-
-    return (
-        BASE_ENTRY_SLIPPAGE
-    )
-
-
-def exit_slippage(
-    liquidity,
-):
-
-    if liquidity < 5_000:
-
-        return (
-            BASE_EXIT_SLIPPAGE
-            + ULTRA_LOW_LIQ_EXTRA_SLIPPAGE
-        )
-
-    if liquidity < 15_000:
-
-        return (
-            BASE_EXIT_SLIPPAGE
-            + LOW_LIQ_EXTRA_SLIPPAGE
-        )
-
-    if liquidity < 30_000:
-
-        return (
-            BASE_EXIT_SLIPPAGE
-            + 0.008
-        )
-
-    return (
-        BASE_EXIT_SLIPPAGE
-    )
-
-
-# ============================================================
-# OPEN PAPER TRADE
-# ============================================================
-
-def open_trade(
-    coin,
-):
+def open_paper_trade(candidate):
 
     global paper_cash
 
-    allowed, _ = (
-        trading_allowed()
-    )
+    allowed, _ = trading_status()
 
     if not allowed:
         return None
 
-    if (
-        len(positions)
-        >= MAX_OPEN_POSITIONS
-    ):
+    if len(positions) >= MAX_OPEN_POSITIONS:
         return None
 
-    address = coin[
-        "address"
-    ]
+    if candidate["score"] < ENTRY_SCORE:
+        return None
+
+    address = candidate["address"]
 
     if address in positions:
         return None
 
-    if (
-        coin["score"]
-        >= STRONG_ENTRY_SCORE
-    ):
+    market_price = candidate["price"]
 
-        trade_size = (
-            STRONG_TRADE_SIZE
-        )
-
-    else:
-
-        trade_size = (
-            BASE_TRADE_SIZE
-        )
-
-    quote = coin[
-        "price"
-    ]
-
-    if quote <= 0:
+    if market_price <= 0:
         return None
 
-    slip = entry_slippage(
-        coin["liquidity"]
+    entry_price = (
+        market_price
+        * (1 + ENTRY_SLIPPAGE)
     )
 
-    simulated_entry = (
-        quote
-        * (
-            1 + slip
-        )
-    )
-
-    fee = (
-        trade_size
+    entry_fee = (
+        TRADE_SIZE
         * FEE_RATE
     )
 
-    required = (
-        trade_size
-        + fee
+    total_cost = (
+        TRADE_SIZE
+        + entry_fee
     )
 
-    if paper_cash < required:
+    if paper_cash < total_cost:
         return None
 
     quantity = (
-        trade_size
-        / simulated_entry
+        TRADE_SIZE
+        / entry_price
     )
 
     position = {
-        "address":
-            address,
+        "address": address,
 
-        "name":
-            coin["name"],
+        "name": candidate["name"],
+        "symbol": candidate["symbol"],
 
-        "symbol":
-            coin["symbol"],
+        "score": candidate["score"],
 
-        "risk":
-            coin["risk"],
+        "market_cap":
+            candidate["market_cap"],
 
-        "score":
-            coin["score"],
+        "liquidity":
+            candidate["liquidity"],
 
         "trade_size":
-            trade_size,
+            TRADE_SIZE,
 
         "entry_quote":
-            quote,
+            market_price,
 
         "entry_price":
-            simulated_entry,
+            entry_price,
 
         "entry_fee":
-            fee,
-
-        "entry_slippage":
-            slip,
+            entry_fee,
 
         "quantity":
             quantity,
 
-        "market_cap":
-            coin["market_cap"],
-
-        "liquidity":
-            coin["liquidity"],
-
         "highest_quote":
-            quote,
+            market_price,
 
         "trailing":
             False,
@@ -1624,15 +1046,11 @@ def open_trade(
             time.time(),
     }
 
-    paper_cash -= required
+    paper_cash -= total_cost
 
-    positions[
-        address
-    ] = position
+    positions[address] = position
 
-    recent_entries[
-        address
-    ] = time.time()
+    recent_entries[address] = time.time()
 
     save_state()
 
@@ -1640,38 +1058,29 @@ def open_trade(
 
 
 # ============================================================
-# EXIT CALCULATION
+# 25. ESTIMATE PAPER EXIT
 # ============================================================
 
-def estimate_exit(
-    position,
-    quote,
-    liquidity,
-):
-
-    slip = exit_slippage(
-        liquidity
-    )
+def estimate_exit(position, market_price):
 
     simulated_exit = (
-        quote
-        * (
-            1 - slip
-        )
+        market_price
+        * (1 - EXIT_SLIPPAGE)
     )
 
-    gross = (
+    gross_proceeds = (
         position["quantity"]
         * simulated_exit
     )
 
     exit_fee = (
-        gross
+        gross_proceeds
         * FEE_RATE
     )
 
     proceeds = (
-        gross - exit_fee
+        gross_proceeds
+        - exit_fee
     )
 
     original_cost = (
@@ -1684,13 +1093,17 @@ def estimate_exit(
         - original_cost
     )
 
-    pnl_pct = (
-        pnl
-        / original_cost
-        * 100
-        if original_cost
-        else 0
-    )
+    if original_cost > 0:
+
+        pnl_percent = (
+            pnl
+            / original_cost
+            * 100
+        )
+
+    else:
+
+        pnl_percent = 0.0
 
     return {
         "exit_price":
@@ -1699,68 +1112,54 @@ def estimate_exit(
         "exit_fee":
             exit_fee,
 
-        "exit_slippage":
-            slip,
-
         "proceeds":
             proceeds,
 
         "pnl":
             pnl,
 
-        "pnl_pct":
-            pnl_pct,
+        "pnl_percent":
+            pnl_percent,
     }
 
 
 # ============================================================
-# CLOSE TRADE
+# 26. CLOSE PAPER TRADE
 # ============================================================
 
-def close_trade(
+def close_paper_trade(
     address,
-    quote,
-    liquidity,
+    market_price,
     reason,
 ):
 
     global paper_cash
 
-    global daily_realized_pnl
-    global daily_trade_count
+    global daily_pnl
+    global daily_trades
     global daily_wins
     global daily_losses
 
-    reset_daily_stats_if_needed()
+    reset_daily_if_needed()
 
-    position = (
-        positions.get(
-            address
-        )
-    )
+    position = positions.get(address)
 
     if not position:
         return None
 
     result = estimate_exit(
         position,
-        quote,
-        liquidity,
+        market_price,
     )
 
-    paper_cash += (
-        result["proceeds"]
-    )
+    paper_cash += result["proceeds"]
 
     trade = {
         **position,
         **result,
 
         "exit_quote":
-            quote,
-
-        "exit_liquidity":
-            liquidity,
+            market_price,
 
         "reason":
             reason,
@@ -1769,28 +1168,21 @@ def close_trade(
             time.time(),
     }
 
-    trade_history.append(
-        trade
-    )
-
-    daily_trade_count += 1
-
-    daily_realized_pnl += (
-        result["pnl"]
-    )
-
-    if result["pnl"] > 0:
-
-        daily_wins += 1
-
-    else:
-
-        daily_losses += 1
+    trade_history.append(trade)
 
     positions.pop(
         address,
         None,
     )
+
+    daily_pnl += result["pnl"]
+    daily_trades += 1
+
+    if result["pnl"] > 0:
+        daily_wins += 1
+
+    else:
+        daily_losses += 1
 
     save_state()
 
@@ -1798,7 +1190,7 @@ def close_trade(
 
 
 # ============================================================
-# AUTOMATIC SCANNER
+# 27. AUTOMATIC SNIPER JOB
 # ============================================================
 
 async def sniper_job(
@@ -1806,121 +1198,128 @@ async def sniper_job(
 ):
 
     global last_scan_time
-    global last_scan_candidates
+    global last_scan_count
     global last_scan_best
+    global last_scan_error
 
-    allowed, reason = (
-        trading_allowed()
-    )
-
-    if not allowed:
-
-        print(
-            "New entries paused:",
-            reason,
-        )
-
-        return
-
-    chat_id = (
-        context.job.chat_id
-    )
+    chat_id = context.job.chat_id
 
     try:
 
-        rankings = (
-            await asyncio.to_thread(
-                get_rankings
-            )
+        rankings = await asyncio.to_thread(
+            get_rankings
         )
+
+        last_scan_time = time.time()
+
+        last_scan_count = len(
+            rankings
+        )
+
+        last_scan_best = (
+            rankings[0]
+            if rankings
+            else None
+        )
+
+        last_scan_error = "none"
 
     except Exception as error:
 
+        last_scan_time = time.time()
+
+        last_scan_count = 0
+
+        last_scan_best = None
+
+        last_scan_error = (
+            f"{type(error).__name__}: "
+            f"{error}"
+        )
+
         print(
-            "sniper_job:",
-            repr(error),
+            "scanner error:",
+            last_scan_error,
         )
 
         return
-
-    last_scan_time = time.time()
-
-    last_scan_candidates = (
-        len(rankings)
-    )
-
-    last_scan_best = (
-        rankings[0]
-        if rankings
-        else None
-    )
 
     if not rankings:
         return
 
-
-    # WATCH ALERT
-
     best = rankings[0]
 
+    # -----------------------------------------
+    # WATCH MESSAGE
+    # -----------------------------------------
+
+    previous_alert = fnum(
+        recent_alerts.get(
+            best["address"]
+        )
+    )
+
     if (
-        best["score"]
-        >= WATCH_SCORE
+        best["score"] >= WATCH_SCORE
+        and
+        time.time() - previous_alert
+        >= WATCH_COOLDOWN_SECONDS
     ):
 
-        previous = (
-            recent_watch_alerts.get(
-                best["address"],
-                0,
-            )
+        recent_alerts[
+            best["address"]
+        ] = time.time()
+
+        strengths = ", ".join(
+            best["reasons"][:3]
         )
 
-        if (
-            time.time()
-            - previous
-            >= WATCH_COOLDOWN
-        ):
+        risks = ", ".join(
+            best["risks"][:3]
+        )
 
-            recent_watch_alerts[
-                best["address"]
-            ] = time.time()
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "👀 SNIPER WATCH\n\n"
 
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "🎯 SNIPER WATCH\n\n"
+                f"{best['name']} "
+                f"({best['symbol']})\n"
 
-                    f"{best['name']} "
-                    f"({best['symbol']})\n"
+                f"Score: "
+                f"{best['score']}/100\n"
 
-                    f"{best['risk']}\n"
+                f"Age: "
+                f"{best['age']:.1f}m\n"
 
-                    f"Score: "
-                    f"{best['score']}/100\n"
+                f"MC: "
+                f"${best['market_cap']:,.0f}\n"
 
-                    f"Age: "
-                    f"{best['age']:.1f}m\n"
+                f"Liquidity: "
+                f"${best['liquidity']:,.0f}\n"
 
-                    f"MC: "
-                    f"${best['market_cap']:,.0f}\n"
+                f"5m volume: "
+                f"${best['volume_5m']:,.0f}\n"
 
-                    f"Liquidity: "
-                    f"${best['liquidity']:,.0f}\n"
+                f"B/S: "
+                f"{best['buys_5m']}/"
+                f"{best['sells_5m']}\n"
 
-                    f"5m volume: "
-                    f"${best['volume_5m']:,.0f}\n"
+                f"5m move: "
+                f"{best['change_5m']:+.2f}%\n\n"
 
-                    f"B/S: "
-                    f"{best['buys_5m']}/"
-                    f"{best['sells_5m']}\n"
+                f"Strengths: "
+                f"{strengths or 'none'}\n"
 
-                    f"5m: "
-                    f"{best['change_5m']:+.2f}%"
-                ),
-            )
+                f"Risks: "
+                f"{risks or 'none'}"
+            ),
+        )
 
+    allowed, _ = trading_status()
 
-    # MULTIPLE ENTRIES
+    if not allowed:
+        return
 
     slots = (
         MAX_OPEN_POSITIONS
@@ -1931,30 +1330,15 @@ async def sniper_job(
         return
 
     eligible = [
-        coin
-        for coin
-        in rankings
-        if (
-            coin["score"]
-            >= ENTRY_SCORE
-        )
+        token
+        for token in rankings
+        if token["score"] >= ENTRY_SCORE
     ]
 
-    for coin in eligible[
-        :slots
-    ]:
+    for token in eligible[:slots]:
 
-        allowed, _ = (
-            trading_allowed()
-        )
-
-        if not allowed:
-            break
-
-        position = (
-            open_trade(
-                coin
-            )
+        position = open_paper_trade(
+            token
         )
 
         if not position:
@@ -1963,12 +1347,10 @@ async def sniper_job(
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "⚡ PAPER SNIPE OPENED\n\n"
+                "🎯 PAPER SNIPE OPENED\n\n"
 
                 f"{position['name']} "
                 f"({position['symbol']})\n"
-
-                f"{position['risk']}\n"
 
                 f"Score: "
                 f"{position['score']}/100\n"
@@ -1985,35 +1367,31 @@ async def sniper_job(
                 f"Liquidity: "
                 f"${position['liquidity']:,.0f}\n\n"
 
-                f"Daily target: "
-                f"${DAILY_PROFIT_TARGET:.2f}\n"
+                f"TP: "
+                f"+{TAKE_PROFIT_PERCENT:.1f}%\n"
 
-                f"Today's P/L: "
-                f"${daily_realized_pnl:+.2f}"
+                f"SL: "
+                f"-{STOP_LOSS_PERCENT:.1f}%"
             ),
         )
 
 
 # ============================================================
-# POSITION MONITOR
+# 28. POSITION MONITOR JOB
 # ============================================================
 
 async def monitor_job(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    chat_id = (
-        context.job.chat_id
-    )
+    chat_id = context.job.chat_id
 
     for address in list(
         positions.keys()
     ):
 
-        position = (
-            positions.get(
-                address
-            )
+        position = positions.get(
+            address
         )
 
         if not position:
@@ -2023,7 +1401,7 @@ async def monitor_job(
 
             quote_data = (
                 await asyncio.to_thread(
-                    current_quote,
+                    get_current_quote,
                     address,
                 )
             )
@@ -2031,7 +1409,7 @@ async def monitor_job(
         except Exception as error:
 
             print(
-                "monitor:",
+                "monitor quote error:",
                 repr(error),
             )
 
@@ -2040,154 +1418,115 @@ async def monitor_job(
         if not quote_data:
             continue
 
-        quote = quote_data[
-            "price"
-        ]
+        market_price = (
+            quote_data["price"]
+        )
 
-        liquidity = quote_data[
-            "liquidity"
-        ]
-
-        if quote <= 0:
-            continue
-
-
+        # -----------------------------------------
         # HIGH-WATER MARK
+        # -----------------------------------------
 
         if (
-            quote
-            > position[
-                "highest_quote"
-            ]
+            market_price
+            > position["highest_quote"]
         ):
 
             position[
                 "highest_quote"
-            ] = quote
+            ] = market_price
 
             save_state()
 
-
         result = estimate_exit(
             position,
-            quote,
-            liquidity,
+            market_price,
         )
 
-        pnl_pct = result[
-            "pnl_pct"
-        ]
+        pnl_percent = (
+            result["pnl_percent"]
+        )
 
+        # -----------------------------------------
+        # TRAILING ACTIVATION
+        # -----------------------------------------
 
-        # TRAILING STOP
-
-        high_gain = (
+        gain_from_entry = (
             (
-                position[
-                    "highest_quote"
-                ]
-                - position[
-                    "entry_quote"
-                ]
+                position["highest_quote"]
+                - position["entry_quote"]
             )
-            / position[
-                "entry_quote"
-            ]
+            / position["entry_quote"]
             * 100
         )
 
         if (
-            high_gain
-            >= TRAIL_ACTIVATION
+            gain_from_entry
+            >= TRAIL_START_PERCENT
         ):
 
-            position[
-                "trailing"
-            ] = True
+            position["trailing"] = True
 
-        highest = position[
-            "highest_quote"
-        ]
+        highest = (
+            position["highest_quote"]
+        )
 
         drawdown = (
             (
-                quote - highest
+                market_price
+                - highest
             )
             / highest
             * 100
-            if highest
+            if highest > 0
             else 0
         )
 
-
-        # TIME OPEN
-
         held_minutes = (
             time.time()
-            - position[
-                "opened_at"
-            ]
+            - position["opened_at"]
         ) / 60
-
 
         reason = None
 
+        # -----------------------------------------
+        # EXIT CONDITIONS
+        # -----------------------------------------
+
         if (
-            pnl_pct
-            >= TAKE_PROFIT
+            pnl_percent
+            >= TAKE_PROFIT_PERCENT
         ):
 
-            reason = (
-                "TAKE PROFIT"
-            )
+            reason = "TAKE PROFIT"
 
         elif (
-            pnl_pct
-            <= -STOP_LOSS
+            pnl_percent
+            <= -STOP_LOSS_PERCENT
         ):
 
-            reason = (
-                "STOP LOSS"
-            )
+            reason = "STOP LOSS"
 
         elif (
             position["trailing"]
-            and (
-                drawdown
-                <= -TRAIL_DISTANCE
-            )
+            and drawdown
+            <= -TRAIL_DISTANCE_PERCENT
         ):
 
-            reason = (
-                "TRAILING EXIT"
-            )
+            reason = "TRAILING EXIT"
 
         elif (
             held_minutes
             >= MAX_HOLD_MINUTES
         ):
 
-            reason = (
-                "TIME EXIT"
-            )
-
-        elif (
-            liquidity
-            < MIN_LIQUIDITY * 0.5
-        ):
-
-            reason = (
-                "LIQUIDITY COLLAPSE"
-            )
+            reason = "TIME EXIT"
 
         if not reason:
             continue
 
-
-        trade = close_trade(
+        trade = close_paper_trade(
             address,
-            quote,
-            liquidity,
+            market_price,
             reason,
         )
 
@@ -2196,12 +1535,8 @@ async def monitor_job(
 
         icon = (
             "🟢"
-            if trade["pnl"] >= 0
+            if trade["pnl"] > 0
             else "🔴"
-        )
-
-        allowed, status_text = (
-            trading_allowed()
         )
 
         await context.bot.send_message(
@@ -2216,26 +1551,19 @@ async def monitor_job(
                 f"{trade['reason']}\n"
 
                 f"Return: "
-                f"{trade['pnl_pct']:+.2f}%\n"
+                f"{trade['pnl_percent']:+.2f}%\n"
 
                 f"P/L: "
-                f"${trade['pnl']:+.2f}\n\n"
+                f"${trade['pnl']:+.2f}\n"
 
                 f"Today's P/L: "
-                f"${daily_realized_pnl:+.2f}\n"
-
-                f"Today's trades: "
-                f"{daily_trade_count}/"
-                f"{MAX_TRADES_PER_DAY}\n"
-
-                f"Status: "
-                f"{status_text}"
+                f"${daily_pnl:+.2f}"
             ),
         )
 
 
 # ============================================================
-# JOBS
+# 29. SCHEDULE JOBS
 # ============================================================
 
 def schedule_jobs(
@@ -2243,11 +1571,9 @@ def schedule_jobs(
     chat_id,
 ):
 
-    chat_id = int(
-        chat_id
-    )
+    chat_id = int(chat_id)
 
-    sniper_name = (
+    scanner_name = (
         f"sniper_{chat_id}"
     )
 
@@ -2255,104 +1581,38 @@ def schedule_jobs(
         f"monitor_{chat_id}"
     )
 
-    if not (
-        job_queue.get_jobs_by_name(
-            sniper_name
-        )
+    if not job_queue.get_jobs_by_name(
+        scanner_name
     ):
 
         job_queue.run_repeating(
             sniper_job,
             interval=
-                SCAN_INTERVAL,
-            first=
-                FIRST_SCAN_DELAY,
-            chat_id=
-                chat_id,
-            name=
-                sniper_name,
+                SCAN_INTERVAL_SECONDS,
+            first=5,
+            chat_id=chat_id,
+            name=scanner_name,
         )
 
-    if not (
-        job_queue.get_jobs_by_name(
-            monitor_name
-        )
+    if not job_queue.get_jobs_by_name(
+        monitor_name
     ):
 
         job_queue.run_repeating(
             monitor_job,
             interval=
-                MONITOR_INTERVAL,
-            first=
-                FIRST_MONITOR_DELAY,
-            chat_id=
-                chat_id,
-            name=
-                monitor_name,
-        )
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-async def post_init(
-    application,
-):
-
-    if not CHAT_ID:
-        return
-
-    try:
-
-        chat_id = int(
-            CHAT_ID
-        )
-
-        schedule_jobs(
-            application.job_queue,
-            chat_id,
-        )
-
-        allowed, status_text = (
-            trading_allowed()
-        )
-
-        await application.bot.send_message(
+                MONITOR_INTERVAL_SECONDS,
+            first=8,
             chat_id=chat_id,
-            text=(
-                "🎯 PAPER SNIPER ONLINE\n\n"
-
-                f"Balance: "
-                f"${paper_cash:.2f}\n"
-
-                f"Daily target: "
-                f"${DAILY_PROFIT_TARGET:.2f}\n"
-
-                f"Daily max loss: "
-                f"-${DAILY_MAX_LOSS:.2f}\n"
-
-                f"Max trades/day: "
-                f"{MAX_TRADES_PER_DAY}\n"
-
-                f"Status: "
-                f"{status_text}"
-            ),
-        )
-
-    except Exception as error:
-
-        print(
-            "post_init:",
-            repr(error),
+            name=monitor_name,
         )
 
 
 # ============================================================
-# PAPER EQUITY
+# 30. PAPER EQUITY
 # ============================================================
 
-async def calculate_equity():
+async def calculate_paper_equity():
 
     equity = paper_cash
     unrealized = 0.0
@@ -2363,47 +1623,36 @@ async def calculate_equity():
 
         try:
 
-            data = (
+            quote = (
                 await asyncio.to_thread(
-                    current_quote,
-                    position[
-                        "address"
-                    ],
+                    get_current_quote,
+                    position["address"],
                 )
             )
 
         except Exception:
-
             continue
 
-        if not data:
+        if not quote:
             continue
 
         result = estimate_exit(
             position,
-            data["price"],
-            data["liquidity"],
+            quote["price"],
         )
 
-        equity += (
-            result["proceeds"]
-        )
+        equity += result["proceeds"]
 
-        unrealized += (
-            result["pnl"]
-        )
+        unrealized += result["pnl"]
 
-    return (
-        equity,
-        unrealized,
-    )
+    return equity, unrealized
 
 
 # ============================================================
-# TELEGRAM COMMANDS
+# 31. /START
 # ============================================================
 
-async def start(
+async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
@@ -2414,104 +1663,203 @@ async def start(
     )
 
     await update.message.reply_text(
-        "🎯 CALTANIDE PAPER SNIPER\n\n"
+        "🎯 JARVIS PAPER SNIPER\n\n"
 
         "/status\n"
-        "/today\n"
         "/snipe\n"
         "/paper\n"
-        "/account\n"
         "/positions\n"
         "/history\n"
         "/stats\n"
-        "/resetpaper\n"
-        "/chatid"
+        "/today\n"
+        "/chatid\n"
+        "/resetpaper"
     )
 
 
-async def chatid(
+# ============================================================
+# 32. /STATUS
+# ============================================================
+
+async def status_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    jobs = list(
+        context.job_queue.jobs()
+    )
+
+    _, status = trading_status()
+
+    if last_scan_time:
+
+        scan_age = int(
+            time.time()
+            - last_scan_time
+        )
+
+        scan_text = (
+            f"{scan_age}s ago"
+        )
+
+    else:
+
+        scan_text = "waiting"
+
+    best_text = "none"
+
+    if last_scan_best:
+
+        best_text = (
+            f"{last_scan_best['symbol']} "
+            f"{last_scan_best['score']}/100"
+        )
+
+    await update.message.reply_text(
+        "🟢 SNIPER STATUS\n\n"
+
+        f"Jobs: {len(jobs)}\n"
+        f"Last scan: {scan_text}\n"
+        f"Candidates: {last_scan_count}\n"
+        f"Best: {best_text}\n"
+        f"Last error: {last_scan_error}\n\n"
+
+        f"Cash: ${paper_cash:.2f}\n"
+        f"Open: {len(positions)}/"
+        f"{MAX_OPEN_POSITIONS}\n"
+
+        f"Closed: {len(trade_history)}\n\n"
+
+        f"Entry score: "
+        f"{ENTRY_SCORE}/100\n"
+
+        f"Status: {status}"
+    )
+
+
+# ============================================================
+# 33. /SNIPE
+# ============================================================
+
+async def snipe_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
     await update.message.reply_text(
-        "🆔 Telegram chat ID:\n"
-        f"{update.effective_chat.id}\n\n"
-        "Railway variable:\n"
-        "TELEGRAM_CHAT_ID"
+        "🎯 Scanning..."
     )
 
+    try:
 
-async def today_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+        results = await asyncio.to_thread(
+            get_rankings
+        )
 
-    reset_daily_stats_if_needed()
+    except Exception as error:
 
-    allowed, status_text = (
-        trading_allowed()
-    )
+        await update.message.reply_text(
+            "Scanner error:\n"
+            f"{type(error).__name__}: "
+            f"{error}"
+        )
 
-    remaining = max(
-        0,
-        DAILY_PROFIT_TARGET
-        - daily_realized_pnl,
-    )
+        return
 
-    win_rate = (
-        daily_wins
-        / daily_trade_count
-        * 100
-        if daily_trade_count
-        else 0
-    )
+    if not results:
+
+        await update.message.reply_text(
+            "No qualifying candidates right now."
+        )
+
+        return
+
+    lines = [
+        "🎯 TOP CANDIDATES",
+        "",
+    ]
+
+    for index, token in enumerate(
+        results[:8],
+        start=1,
+    ):
+
+        lines.extend(
+            [
+                (
+                    f"{index}. "
+                    f"{token['name']} "
+                    f"({token['symbol']})"
+                ),
+
+                (
+                    f"Score: "
+                    f"{token['score']}/100"
+                ),
+
+                (
+                    f"Age: "
+                    f"{token['age']:.1f}m"
+                ),
+
+                (
+                    f"MC: "
+                    f"${token['market_cap']:,.0f}"
+                ),
+
+                (
+                    f"Liq: "
+                    f"${token['liquidity']:,.0f}"
+                ),
+
+                (
+                    f"5m vol: "
+                    f"${token['volume_5m']:,.0f}"
+                ),
+
+                (
+                    f"B/S: "
+                    f"{token['buys_5m']}/"
+                    f"{token['sells_5m']}"
+                ),
+
+                (
+                    f"5m: "
+                    f"{token['change_5m']:+.2f}%"
+                ),
+
+                (
+                    f"Token:\n"
+                    f"{token['address']}"
+                ),
+
+                "",
+            ]
+        )
 
     await update.message.reply_text(
-        "🎯 DAILY PAPER TARGET\n\n"
-
-        f"Target: "
-        f"${DAILY_PROFIT_TARGET:.2f}\n"
-
-        f"Today's P/L: "
-        f"${daily_realized_pnl:+.2f}\n"
-
-        f"Remaining: "
-        f"${remaining:.2f}\n\n"
-
-        f"Trades: "
-        f"{daily_trade_count}/"
-        f"{MAX_TRADES_PER_DAY}\n"
-
-        f"Wins: "
-        f"{daily_wins}\n"
-
-        f"Losses: "
-        f"{daily_losses}\n"
-
-        f"Win rate: "
-        f"{win_rate:.1f}%\n\n"
-
-        f"Daily loss limit: "
-        f"-${DAILY_MAX_LOSS:.2f}\n"
-
-        f"Status: "
-        f"{status_text}"
+        "\n".join(lines)[:4000]
     )
 
 
-async def paper(
+# ============================================================
+# 34. /PAPER
+# ============================================================
+
+async def paper_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    (
-        equity,
-        unrealized,
-    ) = await calculate_equity()
+    equity, unrealized = (
+        await calculate_paper_equity()
+    )
 
     realized = sum(
-        trade["pnl"]
+        fnum(
+            trade.get("pnl")
+        )
         for trade
         in trade_history
     )
@@ -2535,199 +1883,22 @@ async def paper(
         f"Closed trades: "
         f"{len(trade_history)}\n\n"
 
-        f"Total realized: "
+        f"Realized P/L: "
         f"${realized:+.2f}\n"
 
         f"Open P/L: "
-        f"${unrealized:+.2f}\n\n"
+        f"${unrealized:+.2f}\n"
 
         f"Today's P/L: "
-        f"${daily_realized_pnl:+.2f}\n"
+        f"${daily_pnl:+.2f}\n\n"
 
         "Mode: PAPER ONLY"
     )
 
 
-async def account(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    await paper(
-        update,
-        context,
-    )
-
-
-async def status(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    jobs = list(
-        context.job_queue.jobs()
-    )
-
-    allowed, status_text = (
-        trading_allowed()
-    )
-
-    if last_scan_time:
-
-        scan_age = int(
-            time.time()
-            - last_scan_time
-        )
-
-        scan_text = (
-            f"{scan_age}s ago"
-        )
-
-    else:
-
-        scan_text = "waiting"
-
-    best = "none"
-
-    if last_scan_best:
-
-        best = (
-            f"{last_scan_best['symbol']} "
-            f"{last_scan_best['score']}/100"
-        )
-
-    await update.message.reply_text(
-        "🟢 SNIPER STATUS\n\n"
-
-        f"Jobs: "
-        f"{len(jobs)}\n"
-
-        f"Last scan: "
-        f"{scan_text}\n"
-
-        f"Candidates: "
-        f"{last_scan_candidates}\n"
-
-        f"Best: "
-        f"{best}\n\n"
-
-        f"Cash: "
-        f"${paper_cash:.2f}\n"
-
-        f"Open: "
-        f"{len(positions)}/"
-        f"{MAX_OPEN_POSITIONS}\n"
-
-        f"Closed: "
-        f"{len(trade_history)}\n\n"
-
-        f"Today's P/L: "
-        f"${daily_realized_pnl:+.2f}\n"
-
-        f"Daily target: "
-        f"${DAILY_PROFIT_TARGET:.2f}\n"
-
-        f"Status: "
-        f"{status_text}"
-    )
-
-
-async def snipe(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    await update.message.reply_text(
-        "🎯 Scanning Solana low caps..."
-    )
-
-    try:
-
-        rankings = (
-            await asyncio.to_thread(
-                get_rankings
-            )
-        )
-
-    except Exception:
-
-        await update.message.reply_text(
-            "Scanner temporarily unavailable."
-        )
-
-        return
-
-    if not rankings:
-
-        await update.message.reply_text(
-            "No candidates currently pass "
-            "the activity filters."
-        )
-
-        return
-
-    lines = [
-        "🎯 TOP SNIPER CANDIDATES",
-        "",
-    ]
-
-    for i, coin in enumerate(
-        rankings[:10],
-        1,
-    ):
-
-        lines.extend(
-            [
-                (
-                    f"{i}. "
-                    f"{coin['name']} "
-                    f"({coin['symbol']})"
-                ),
-
-                (
-                    f"{coin['risk']} | "
-                    f"{coin['score']}/100"
-                ),
-
-                (
-                    f"Age: "
-                    f"{coin['age']:.1f}m"
-                ),
-
-                (
-                    f"MC: "
-                    f"${coin['market_cap']:,.0f}"
-                ),
-
-                (
-                    f"Liq: "
-                    f"${coin['liquidity']:,.0f}"
-                ),
-
-                (
-                    f"5m vol: "
-                    f"${coin['volume_5m']:,.0f}"
-                ),
-
-                (
-                    f"B/S: "
-                    f"{coin['buys_5m']}/"
-                    f"{coin['sells_5m']}"
-                ),
-
-                (
-                    f"5m: "
-                    f"{coin['change_5m']:+.2f}%"
-                ),
-
-                "",
-            ]
-        )
-
-    await update.message.reply_text(
-        "\n".join(lines)[:4000]
-    )
-
+# ============================================================
+# 35. /POSITIONS
+# ============================================================
 
 async def positions_command(
     update: Update,
@@ -2743,7 +1914,7 @@ async def positions_command(
         return
 
     lines = [
-        "🎯 OPEN PAPER SNIPES",
+        "🎯 OPEN POSITIONS",
         "",
     ]
 
@@ -2753,35 +1924,32 @@ async def positions_command(
 
         try:
 
-            data = (
-                await asyncio.to_thread(
-                    current_quote,
-                    position["address"],
-                )
+            quote = await asyncio.to_thread(
+                get_current_quote,
+                position["address"],
             )
 
         except Exception:
 
-            data = None
+            quote = None
 
-        if data:
+        if quote:
 
             result = estimate_exit(
                 position,
-                data["price"],
-                data["liquidity"],
+                quote["price"],
             )
 
-            pnl = (
-                f"{result['pnl_pct']:+.2f}% "
+            pnl_text = (
+                f"{result['pnl_percent']:+.2f}% "
                 f"(${result['pnl']:+.2f})"
             )
 
         else:
 
-            pnl = "unavailable"
+            pnl_text = "unavailable"
 
-        held = (
+        held_minutes = (
             time.time()
             - position["opened_at"]
         ) / 60
@@ -2794,27 +1962,18 @@ async def positions_command(
                 ),
 
                 (
-                    f"{position['risk']}"
-                ),
-
-                (
                     f"Score: "
                     f"{position['score']}/100"
                 ),
 
                 (
-                    f"Stake: "
-                    f"${position['trade_size']:.2f}"
-                ),
-
-                (
                     f"P/L: "
-                    f"{pnl}"
+                    f"{pnl_text}"
                 ),
 
                 (
                     f"Held: "
-                    f"{held:.1f}m"
+                    f"{held_minutes:.1f}m"
                 ),
 
                 "",
@@ -2825,6 +1984,10 @@ async def positions_command(
         "\n".join(lines)[:4000]
     )
 
+
+# ============================================================
+# 36. /HISTORY
+# ============================================================
 
 async def history_command(
     update: Update,
@@ -2840,17 +2003,25 @@ async def history_command(
         return
 
     lines = [
-        "📚 RECENT PAPER SNIPES",
+        "📚 PAPER HISTORY",
         "",
     ]
 
-    for trade in (
-        trade_history[-20:]
-    ):
+    for trade in trade_history[-20:]:
+
+        pnl = fnum(
+            trade.get("pnl")
+        )
+
+        pnl_percent = fnum(
+            trade.get(
+                "pnl_percent"
+            )
+        )
 
         icon = (
             "🟢"
-            if trade["pnl"] > 0
+            if pnl > 0
             else "🔴"
         )
 
@@ -2858,16 +2029,16 @@ async def history_command(
             [
                 (
                     f"{icon} "
-                    f"{trade['symbol']}"
+                    f"{trade.get('symbol', '?')}"
                 ),
 
                 (
-                    f"{trade['reason']}"
+                    f"{trade.get('reason', '?')}"
                 ),
 
                 (
-                    f"{trade['pnl_pct']:+.2f}% "
-                    f"(${trade['pnl']:+.2f})"
+                    f"{pnl_percent:+.2f}% "
+                    f"(${pnl:+.2f})"
                 ),
 
                 "",
@@ -2879,7 +2050,11 @@ async def history_command(
     )
 
 
-async def stats(
+# ============================================================
+# 37. /STATS
+# ============================================================
+
+async def stats_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
@@ -2893,21 +2068,25 @@ async def stats(
         return
 
     returns = [
-        trade["pnl_pct"]
+        fnum(
+            trade.get(
+                "pnl_percent"
+            )
+        )
         for trade
         in trade_history
     ]
 
     winners = [
-        r
-        for r in returns
-        if r > 0
+        result
+        for result in returns
+        if result > 0
     ]
 
     losers = [
-        r
-        for r in returns
-        if r <= 0
+        result
+        for result in returns
+        if result <= 0
     ]
 
     win_rate = (
@@ -2916,61 +2095,144 @@ async def stats(
         * 100
     )
 
-    average = (
+    average_trade = (
         sum(returns)
         / len(returns)
     )
 
-    avg_win = (
+    average_winner = (
         sum(winners)
         / len(winners)
         if winners
         else 0
     )
 
-    avg_loss = (
+    average_loser = (
         sum(losers)
         / len(losers)
         if losers
         else 0
     )
 
-    total = sum(
-        trade["pnl"]
+    total_pnl = sum(
+        fnum(
+            trade.get("pnl")
+        )
         for trade
         in trade_history
     )
 
     await update.message.reply_text(
-        "📊 SNIPER PERFORMANCE\n\n"
+        "📊 SNIPER STATS\n\n"
 
-        f"Trades: "
-        f"{len(returns)}\n"
+        f"Trades: {len(returns)}\n"
 
         f"Win rate: "
         f"{win_rate:.1f}%\n"
 
         f"Average trade: "
-        f"{average:+.2f}%\n"
+        f"{average_trade:+.2f}%\n"
 
         f"Average winner: "
-        f"{avg_win:+.2f}%\n"
+        f"{average_winner:+.2f}%\n"
 
         f"Average loser: "
-        f"{avg_loss:+.2f}%\n"
+        f"{average_loser:+.2f}%\n\n"
 
         f"Best: "
         f"{max(returns):+.2f}%\n"
 
         f"Worst: "
-        f"{min(returns):+.2f}%\n\n"
+        f"{min(returns):+.2f}%\n"
 
-        f"Total realized: "
-        f"${total:+.2f}"
+        f"Total P/L: "
+        f"${total_pnl:+.2f}"
     )
 
 
-async def resetpaper(
+# ============================================================
+# 38. /TODAY
+# ============================================================
+
+async def today_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    reset_daily_if_needed()
+
+    _, status = trading_status()
+
+    remaining = max(
+        0.0,
+        DAILY_TARGET - daily_pnl,
+    )
+
+    if daily_trades:
+
+        win_rate = (
+            daily_wins
+            / daily_trades
+            * 100
+        )
+
+    else:
+
+        win_rate = 0.0
+
+    await update.message.reply_text(
+        "🎯 TODAY\n\n"
+
+        f"Target: "
+        f"${DAILY_TARGET:.2f}\n"
+
+        f"P/L: "
+        f"${daily_pnl:+.2f}\n"
+
+        f"Remaining: "
+        f"${remaining:.2f}\n\n"
+
+        f"Trades: "
+        f"{daily_trades}/"
+        f"{MAX_TRADES_PER_DAY}\n"
+
+        f"Wins: "
+        f"{daily_wins}\n"
+
+        f"Losses: "
+        f"{daily_losses}\n"
+
+        f"Win rate: "
+        f"{win_rate:.1f}%\n\n"
+
+        f"Loss limit: "
+        f"-${DAILY_MAX_LOSS:.2f}\n"
+
+        f"Status: "
+        f"{status}"
+    )
+
+
+# ============================================================
+# 39. /CHATID
+# ============================================================
+
+async def chatid_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    await update.message.reply_text(
+        "Telegram Chat ID:\n"
+        f"{update.effective_chat.id}"
+    )
+
+
+# ============================================================
+# 40. /RESETPAPER
+# ============================================================
+
+async def resetpaper_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
@@ -2980,8 +2242,8 @@ async def resetpaper(
     global trade_history
     global recent_entries
 
-    global daily_realized_pnl
-    global daily_trade_count
+    global daily_pnl
+    global daily_trades
     global daily_wins
     global daily_losses
 
@@ -2992,23 +2254,23 @@ async def resetpaper(
     ):
 
         await update.message.reply_text(
-            "⚠️ This erases the paper account.\n\n"
+            "⚠️ This clears the entire "
+            "paper account.\n\n"
+
             "Send:\n"
             "/resetpaper confirm"
         )
 
         return
 
-    paper_cash = (
-        STARTING_BALANCE
-    )
+    paper_cash = STARTING_BALANCE
 
     positions = {}
     trade_history = []
     recent_entries = {}
 
-    daily_realized_pnl = 0
-    daily_trade_count = 0
+    daily_pnl = 0.0
+    daily_trades = 0
     daily_wins = 0
     daily_losses = 0
 
@@ -3022,52 +2284,172 @@ async def resetpaper(
 
 
 # ============================================================
-# MAIN
+# 41. POST INIT
+# ============================================================
+
+async def post_init(application):
+
+    if not TELEGRAM_CHAT_ID:
+
+        print(
+            "TELEGRAM_CHAT_ID not set."
+        )
+
+        return
+
+    try:
+
+        chat_id = int(
+            TELEGRAM_CHAT_ID
+        )
+
+        schedule_jobs(
+            application.job_queue,
+            chat_id,
+        )
+
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "✅ JARVIS SNIPER ONLINE\n\n"
+
+                "Mode: PAPER ONLY\n"
+
+                f"Entry score: "
+                f"{ENTRY_SCORE}/100\n"
+
+                f"Trade size: "
+                f"${TRADE_SIZE:.2f}\n"
+
+                f"Max positions: "
+                f"{MAX_OPEN_POSITIONS}\n"
+
+                f"TP: "
+                f"+{TAKE_PROFIT_PERCENT:.1f}%\n"
+
+                f"SL: "
+                f"-{STOP_LOSS_PERCENT:.1f}%"
+            ),
+        )
+
+    except Exception as error:
+
+        print(
+            "post_init error:",
+            repr(error),
+        )
+
+
+# ============================================================
+# 42. MAIN
 # ============================================================
 
 def main():
+
+    print("Starting Jarvis...")
+
+    print(
+        "TELEGRAM_BOT_TOKEN:",
+        "SET"
+        if TELEGRAM_BOT_TOKEN
+        else "MISSING",
+    )
+
+    print(
+        "TELEGRAM_CHAT_ID:",
+        "SET"
+        if TELEGRAM_CHAT_ID
+        else "MISSING",
+    )
 
     load_state()
 
     application = (
         Application.builder()
-        .token(
-            BOT_TOKEN
-        )
-        .post_init(
-            post_init
-        )
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
         .build()
     )
 
-    commands = [
-        ("start", start),
-        ("status", status),
-        ("today", today_command),
-        ("snipe", snipe),
-        ("paper", paper),
-        ("account", account),
-        ("positions", positions_command),
-        ("history", history_command),
-        ("stats", stats),
-        ("resetpaper", resetpaper),
-        ("chatid", chatid),
-    ]
-
-    for (
-        command,
-        callback,
-    ) in commands:
-
-        application.add_handler(
-            CommandHandler(
-                command,
-                callback,
-            )
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start_command,
         )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "status",
+            status_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "snipe",
+            snipe_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "paper",
+            paper_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "account",
+            paper_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "positions",
+            positions_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "history",
+            history_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "stats",
+            stats_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "today",
+            today_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "chatid",
+            chatid_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "resetpaper",
+            resetpaper_command,
+        )
+    )
 
     print(
-        "CALTANIDE PAPER SNIPER ONLINE"
+        "Jarvis started successfully."
     )
 
     application.run_polling(
