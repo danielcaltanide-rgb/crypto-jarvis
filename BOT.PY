@@ -217,15 +217,21 @@ def score_candidate(c):
 # -------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+chat_id = update.effective_chat.id
+await update.message.reply_text(
         "🤖 Crypto Jarvis online.\n\n"
         "Commands:\n"
         "/price bitcoin\n"
         "/analyse bitcoin\n"
         "/hunt"
     )
-
-
+    context.job_queue.run_repeating(
+        auto_hunt,
+        interval=300,
+        first=60,
+        chat_id=chat_id,
+    ) 
+ 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not context.args:
@@ -442,7 +448,7 @@ def main():
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("analyse", analyse))
     app.add_handler(CommandHandler("hunt", hunt))
-    app.job_queue.run_repeating(auto_hunt, interval=300, first=60)
+    
 
     print("Crypto Jarvis online")
 
