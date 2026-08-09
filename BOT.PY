@@ -1,20 +1,17 @@
 import os
 import time
+import json
 import asyncio
 import requests
-from collections import deque
+from pathlib import Path
 
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 
-# ============================================================
-# CONFIG
-# ============================================================
+# =========================================================
+# ENVIRONMENT
+# =========================================================
 
 BOT_TOKEN = (
     os.getenv("TELEGRAM_BOT_TOKEN")
@@ -25,95 +22,76 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 if not BOT_TOKEN:
     raise RuntimeError(
-        "Missing TELEGRAM_BOT_TOKEN in Railway variables."
+        "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_TOKEN."
     )
 
 
-# ============================================================
-# PAPER ACCOUNT
-# ============================================================
+# =========================================================
+# FILE PERSISTENCE
+# =========================================================
+
+STATE_FILE = Path("paper_sniper_state.json")
+
+
+# =========================================================
+# PAPER ACCOUNT SETTINGS
+# =========================================================
 
 STARTING_BALANCE = 1000.00
-
-# Amount allocated to each simulated trade
 TRADE_SIZE = 20.00
 
-# Allows multiple trades at once
 MAX_OPEN_POSITIONS = 5
 
-# Minimum score required for automatic paper entry
 ENTRY_SCORE = 62
-
-# Minimum score shown as a watch alert
 WATCH_SCORE = 55
 
 
-# ============================================================
+# =========================================================
 # SCAN SPEED
-# ============================================================
+# =========================================================
 
-# New-token discovery
 SCAN_INTERVAL = 20
-
-# Open-position monitoring
 MONITOR_INTERVAL = 8
 
-# First automatic scan after startup
 FIRST_SCAN_DELAY = 10
 
 
-# ============================================================
+# =========================================================
 # NEW COIN FILTERS
-# ============================================================
+# =========================================================
 
-# Avoid buying instantly after creation because initial data
-# can be extremely noisy.
 MIN_AGE_MINUTES = 2
-
-# We want genuinely fresh pairs
 MAX_AGE_MINUTES = 180
 
-# Small-cap range
 MIN_MARKET_CAP = 25_000
 MAX_MARKET_CAP = 2_500_000
 
-# Liquidity filters
 MIN_LIQUIDITY = 12_000
 MAX_LIQUIDITY = 800_000
 
-# Activity requirements
 MIN_5M_VOLUME = 1_500
 MIN_5M_TRANSACTIONS = 8
 
-# Reject huge already-extended candles
 MAX_5M_PUMP = 30.0
 MAX_1H_PUMP = 150.0
 
 
-# ============================================================
-# EXIT SETTINGS
-# ============================================================
+# =========================================================
+# EXIT RULES
+# =========================================================
 
-# Net estimated paper profit/loss thresholds
 TAKE_PROFIT = 5.0
 STOP_LOSS = 3.0
 
-# Once trade has reached +3%, protect the winner
 TRAIL_ACTIVATION = 3.0
-
-# Exit after dropping this much from peak
 TRAIL_DISTANCE = 2.0
 
-# Fast sniper — don't marry the meme coin
 MAX_HOLD_MINUTES = 15
 
 
-# ============================================================
-# PAPER EXECUTION COSTS
-# ============================================================
-
-# New coins can have ugly execution.
-# These deliberately penalize paper performance.
+# =========================================================
+# SIMULATED EXECUTION COSTS
+# =========================================================
 
 ENTRY_SLIPPAGE = 0.008
 EXIT_SLIPPAGE = 0.008
@@ -122,36 +100,32 @@ ENTRY_FEE_RATE = 0.003
 EXIT_FEE_RATE = 0.003
 
 
-# ============================================================
-# REENTRY / ALERT PROTECTION
-# ============================================================
+# =========================================================
+# COOLDOWNS
+# =========================================================
 
-# Same token cannot be bought again for 30 minutes
 REENTRY_COOLDOWN = 30 * 60
-
-# Don't spam the same watch alert
 WATCH_COOLDOWN = 5 * 60
 
 
-# ============================================================
+# =========================================================
 # HTTP
-# ============================================================
+# =========================================================
 
 HTTP_TIMEOUT = 12
 
-SESSION = requests.Session()
+session = requests.Session()
 
-SESSION.headers.update(
+session.headers.update(
     {
-        "User-Agent":
-            "CaltanidePaperSniper/1.0"
+        "User-Agent": "CaltanidePaperSniper/2.0"
     }
 )
 
 
-# ============================================================
-# STATE
-# ============================================================
+# =========================================================
+# RUNTIME STATE
+# =========================================================
 
 paper_cash = STARTING_BALANCE
 
@@ -161,28 +135,101 @@ history = []
 recent_entries = {}
 recent_watch_alerts = {}
 
-last_scan_time = 0
+last_scan_time = 0.0
 last_scan_candidates = 0
 last_scan_best = None
 
-# Remember recently discovered addresses so the scanner
-# has a larger candidate pool than only the current response.
 known_addresses = {}
 
-MAX_KNOWN_ADDRESSES = 600
 ADDRESS_MEMORY_SECONDS = 6 * 60 * 60
-
-# Keep recent scanner activity for /stats
-scan_log = deque(maxlen=200)
+MAX_KNOWN_ADDRESSES = 600
 
 
-# ============================================================
-# API HELPERS
-# ============================================================
+# =========================================================
+# PERSISTENCE
+# =========================================================
+
+def save_state():
+
+    data = {
+        "paper_cash": paper_cash,
+        "positions": positions,
+        "history": history,
+        "recent_entries": recent_entries,
+    }
+
+    try:
+        STATE_FILE.write_text(
+            json.dumps(
+                data,
+                indent=2,
+            )
+        )
+
+    except Exception as error:
+        print(
+            "save_state error:",
+            repr(error),
+        )
+
+
+def load_state():
+
+    global paper_cash
+    global positions
+    global history
+    global recent_entries
+
+    if not STATE_FILE.exists():
+        return
+
+    try:
+
+        data = json.loads(
+            STATE_FILE.read_text()
+        )
+
+        paper_cash = float(
+            data.get(
+                "paper_cash",
+                STARTING_BALANCE,
+            )
+        )
+
+        positions = data.get(
+            "positions",
+            {},
+        )
+
+        history = data.get(
+            "history",
+            [],
+        )
+
+        recent_entries = data.get(
+            "recent_entries",
+            {},
+        )
+
+        print(
+            "Paper sniper state loaded."
+        )
+
+    except Exception as error:
+
+        print(
+            "load_state error:",
+            repr(error),
+        )
+
+
+# =========================================================
+# HTTP HELPERS
+# =========================================================
 
 def get_json(url):
 
-    response = SESSION.get(
+    response = session.get(
         url,
         timeout=HTTP_TIMEOUT,
     )
@@ -205,27 +252,23 @@ def chunks(items, size):
         ]
 
 
-# ============================================================
-# DEX SCREENER DISCOVERY
-# ============================================================
+# =========================================================
+# DEX DISCOVERY
+# =========================================================
 
 DISCOVERY_URLS = [
-
     (
         "https://api.dexscreener.com/"
         "token-profiles/latest/v1"
     ),
-
     (
         "https://api.dexscreener.com/"
         "token-boosts/latest/v1"
     ),
-
     (
         "https://api.dexscreener.com/"
         "token-boosts/top/v1"
     ),
-
     (
         "https://api.dexscreener.com/"
         "community-takeovers/latest/v1"
@@ -237,18 +280,19 @@ def cleanup_known_addresses():
 
     now = time.time()
 
-    expired = [
+    expired = []
 
-        address
-
-        for address, timestamp
-        in known_addresses.items()
+    for address, timestamp in (
+        known_addresses.items()
+    ):
 
         if (
             now - timestamp
             > ADDRESS_MEMORY_SECONDS
-        )
-    ]
+        ):
+            expired.append(
+                address
+            )
 
     for address in expired:
 
@@ -257,7 +301,6 @@ def cleanup_known_addresses():
             None,
         )
 
-    # Hard memory limit
     if (
         len(known_addresses)
         > MAX_KNOWN_ADDRESSES
@@ -265,8 +308,7 @@ def cleanup_known_addresses():
 
         ordered = sorted(
             known_addresses.items(),
-            key=lambda item:
-                item[1],
+            key=lambda item: item[1],
             reverse=True,
         )
 
@@ -289,10 +331,7 @@ def discover_solana_tokens():
     for url in DISCOVERY_URLS:
 
         try:
-
-            data = get_json(
-                url
-            )
+            data = get_json(url)
 
         except Exception as error:
 
@@ -335,9 +374,9 @@ def discover_solana_tokens():
     )
 
 
-# ============================================================
-# FETCH PAIRS
-# ============================================================
+# =========================================================
+# PAIR LOOKUP
+# =========================================================
 
 def fetch_candidate_pairs():
 
@@ -350,7 +389,6 @@ def fetch_candidate_pairs():
 
     all_pairs = []
 
-    # DEX Screener token lookup supports batches.
     for batch in chunks(
         addresses,
         30,
@@ -363,10 +401,7 @@ def fetch_candidate_pairs():
         )
 
         try:
-
-            data = get_json(
-                url
-            )
+            data = get_json(url)
 
         except Exception as error:
 
@@ -381,12 +416,10 @@ def fetch_candidate_pairs():
             data,
             list,
         ):
-
             all_pairs.extend(
                 data
             )
 
-    # Keep highest-liquidity Solana pair for each token.
     best_pairs = {}
 
     for pair in all_pairs:
@@ -445,7 +478,6 @@ def fetch_candidate_pairs():
             liquidity
             > old_liquidity
         ):
-
             best_pairs[
                 address
             ] = pair
@@ -453,9 +485,9 @@ def fetch_candidate_pairs():
     return best_pairs
 
 
-# ============================================================
-# NORMALIZE TOKEN DATA
-# ============================================================
+# =========================================================
+# NORMALIZE PAIRS
+# =========================================================
 
 def normalize_pair(
     address,
@@ -502,14 +534,11 @@ def normalize_pair(
     try:
 
         age_minutes = (
-
             int(time.time() * 1000)
             - int(created)
-
-        ) / 60000
+        ) / 60_000
 
     except Exception:
-
         return None
 
     if age_minutes < 0:
@@ -523,24 +552,7 @@ def normalize_pair(
         )
 
     except Exception:
-
-        price = 0
-
-    market_cap = float(
-        pair.get("marketCap")
-        or pair.get("fdv")
-        or 0
-    )
-
-    liquidity = float(
-        (
-            (
-                pair.get("liquidity")
-                or {}
-            ).get("usd")
-        )
-        or 0
-    )
+        price = 0.0
 
     return {
 
@@ -570,10 +582,22 @@ def normalize_pair(
             age_minutes,
 
         "market_cap":
-            market_cap,
+            float(
+                pair.get("marketCap")
+                or pair.get("fdv")
+                or 0
+            ),
 
         "liquidity":
-            liquidity,
+            float(
+                (
+                    (
+                        pair.get("liquidity")
+                        or {}
+                    ).get("usd")
+                )
+                or 0
+            ),
 
         "volume_5m":
             float(
@@ -584,12 +608,6 @@ def normalize_pair(
         "volume_1h":
             float(
                 volume.get("h1")
-                or 0
-            ),
-
-        "volume_24h":
-            float(
-                volume.get("h24")
                 or 0
             ),
 
@@ -631,34 +649,27 @@ def normalize_pair(
     }
 
 
-# ============================================================
-# SNIPER SCORE
-# ============================================================
+# =========================================================
+# SCORE TOKENS
+# =========================================================
 
 def score_token(c):
 
     reasons = []
     risks = []
 
-    # --------------------------------------------------------
-    # HARD REJECTION
-    # --------------------------------------------------------
-
     if c["price"] <= 0:
-
         return (
             0,
             reasons,
             ["invalid price"],
         )
 
-    if (
-        c["age"]
-        < MIN_AGE_MINUTES
-        or c["age"]
-        > MAX_AGE_MINUTES
+    if not (
+        MIN_AGE_MINUTES
+        <= c["age"]
+        <= MAX_AGE_MINUTES
     ):
-
         return (
             0,
             reasons,
@@ -670,7 +681,6 @@ def score_token(c):
         <= c["market_cap"]
         <= MAX_MARKET_CAP
     ):
-
         return (
             0,
             reasons,
@@ -682,7 +692,6 @@ def score_token(c):
         <= c["liquidity"]
         <= MAX_LIQUIDITY
     ):
-
         return (
             0,
             reasons,
@@ -693,11 +702,10 @@ def score_token(c):
         c["volume_5m"]
         < MIN_5M_VOLUME
     ):
-
         return (
             0,
             reasons,
-            ["volume rejected"],
+            ["5m volume rejected"],
         )
 
     tx_count = (
@@ -709,7 +717,6 @@ def score_token(c):
         tx_count
         < MIN_5M_TRANSACTIONS
     ):
-
         return (
             0,
             reasons,
@@ -720,7 +727,6 @@ def score_token(c):
         c["change_5m"]
         > MAX_5M_PUMP
     ):
-
         return (
             0,
             reasons,
@@ -731,22 +737,16 @@ def score_token(c):
         c["change_1h"]
         > MAX_1H_PUMP
     ):
-
         return (
             0,
             reasons,
             ["1h pump too extended"],
         )
 
-
-    # --------------------------------------------------------
-    # SCORE
-    # --------------------------------------------------------
-
     score = 0
 
 
-    # AGE — sniper wants fresh activity
+    # AGE
 
     if c["age"] <= 10:
 
@@ -810,7 +810,7 @@ def score_token(c):
         score += 17
 
         reasons.append(
-            "good sniper liquidity"
+            "usable liquidity"
         )
 
     elif (
@@ -861,9 +861,7 @@ def score_token(c):
         score += 4
 
 
-    # --------------------------------------------------------
     # VOLUME ACCELERATION
-    # --------------------------------------------------------
 
     if (
         c["volume_1h"]
@@ -882,7 +880,10 @@ def score_token(c):
                 / expected_5m
             )
 
-            if acceleration >= 4:
+            if (
+                acceleration
+                >= 4
+            ):
 
                 score += 14
 
@@ -890,7 +891,10 @@ def score_token(c):
                     "volume exploding"
                 )
 
-            elif acceleration >= 2:
+            elif (
+                acceleration
+                >= 2
+            ):
 
                 score += 10
 
@@ -898,11 +902,17 @@ def score_token(c):
                     "volume accelerating"
                 )
 
-            elif acceleration >= 1.25:
+            elif (
+                acceleration
+                >= 1.25
+            ):
 
                 score += 5
 
-            elif acceleration < 0.5:
+            elif (
+                acceleration
+                < 0.5
+            ):
 
                 score -= 6
 
@@ -911,17 +921,15 @@ def score_token(c):
                 )
 
 
-    # --------------------------------------------------------
-    # BUY / SELL PRESSURE
-    # --------------------------------------------------------
+    # BUY PRESSURE
 
-    buys = c[
-        "buys_5m"
-    ]
+    buys = (
+        c["buys_5m"]
+    )
 
-    sells = c[
-        "sells_5m"
-    ]
+    sells = (
+        c["sells_5m"]
+    )
 
     if (
         sells == 0
@@ -940,7 +948,9 @@ def score_token(c):
             buys / sells
         )
 
-        if ratio >= 3:
+        if (
+            ratio >= 3
+        ):
 
             score += 16
 
@@ -948,7 +958,9 @@ def score_token(c):
                 "extreme buy pressure"
             )
 
-        elif ratio >= 2:
+        elif (
+            ratio >= 2
+        ):
 
             score += 13
 
@@ -956,11 +968,15 @@ def score_token(c):
                 "strong buy pressure"
             )
 
-        elif ratio >= 1.4:
+        elif (
+            ratio >= 1.4
+        ):
 
             score += 8
 
-        elif ratio < 0.8:
+        elif (
+            ratio < 0.8
+        ):
 
             score -= 12
 
@@ -969,13 +985,11 @@ def score_token(c):
             )
 
 
-    # --------------------------------------------------------
     # MOMENTUM
-    # --------------------------------------------------------
 
-    move = c[
-        "change_5m"
-    ]
+    move = (
+        c["change_5m"]
+    )
 
     if (
         1
@@ -1022,24 +1036,16 @@ def score_token(c):
         score -= 5
 
 
-    # --------------------------------------------------------
-    # LIQUIDITY / MARKET CAP
-    # --------------------------------------------------------
+    # LIQUIDITY RATIO
 
-    if (
-        c["market_cap"]
-        > 0
-    ):
+    if c["market_cap"] > 0:
 
-        liquidity_ratio = (
+        ratio = (
             c["liquidity"]
             / c["market_cap"]
         )
 
-        if (
-            liquidity_ratio
-            >= 0.25
-        ):
+        if ratio >= 0.25:
 
             score += 9
 
@@ -1047,17 +1053,11 @@ def score_token(c):
                 "strong liquidity ratio"
             )
 
-        elif (
-            liquidity_ratio
-            >= 0.10
-        ):
+        elif ratio >= 0.10:
 
             score += 5
 
-        elif (
-            liquidity_ratio
-            < 0.03
-        ):
+        elif ratio < 0.03:
 
             score -= 15
 
@@ -1065,23 +1065,24 @@ def score_token(c):
                 "thin liquidity"
             )
 
+    score = max(
+        0,
+        min(
+            score,
+            100,
+        ),
+    )
 
     return (
-        max(
-            0,
-            min(
-                score,
-                100,
-            ),
-        ),
+        score,
         reasons,
         risks,
     )
 
 
-# ============================================================
-# GET RANKINGS
-# ============================================================
+# =========================================================
+# RANK COINS
+# =========================================================
 
 def get_rankings():
 
@@ -1093,10 +1094,9 @@ def get_rankings():
 
     now = time.time()
 
-    for (
-        address,
-        pair,
-    ) in pairs.items():
+    for address, pair in (
+        pairs.items()
+    ):
 
         candidate = (
             normalize_pair(
@@ -1108,14 +1108,12 @@ def get_rankings():
         if not candidate:
             continue
 
-        # Don't show already-open token
         if (
             address
             in positions
         ):
             continue
 
-        # Reentry cooldown
         previous_entry = (
             recent_entries.get(
                 address,
@@ -1131,7 +1129,6 @@ def get_rankings():
             )
             < REENTRY_COOLDOWN
         ):
-
             continue
 
         (
@@ -1162,24 +1159,21 @@ def get_rankings():
         )
 
     results.sort(
-
         key=lambda coin: (
-
             coin["score"],
             coin["volume_5m"],
             coin["buys_5m"],
             coin["liquidity"],
         ),
-
         reverse=True,
     )
 
     return results
 
 
-# ============================================================
-# CURRENT PRICE
-# ============================================================
+# =========================================================
+# TOKEN PRICE
+# =========================================================
 
 def get_token_price(
     address,
@@ -1202,14 +1196,10 @@ def get_token_price(
         )
         or not data
     ):
-
         return None
 
-    # Highest-liquidity pair
     pair = max(
-
         data,
-
         key=lambda item: float(
             (
                 (
@@ -1229,13 +1219,12 @@ def get_token_price(
         )
 
     except Exception:
-
         return None
 
 
-# ============================================================
-# PAPER P/L
-# ============================================================
+# =========================================================
+# ESTIMATE PAPER EXIT
+# =========================================================
 
 def estimate_exit(
     position,
@@ -1243,9 +1232,7 @@ def estimate_exit(
 ):
 
     simulated_exit_price = (
-
         quote
-
         * (
             1
             - EXIT_SLIPPAGE
@@ -1253,11 +1240,7 @@ def estimate_exit(
     )
 
     gross = (
-
-        position[
-            "quantity"
-        ]
-
+        position["quantity"]
         * simulated_exit_price
     )
 
@@ -1272,14 +1255,8 @@ def estimate_exit(
     )
 
     total_entry_cost = (
-
-        position[
-            "trade_size"
-        ]
-
-        + position[
-            "entry_fee"
-        ]
+        position["trade_size"]
+        + position["entry_fee"]
     )
 
     pnl = (
@@ -1288,11 +1265,9 @@ def estimate_exit(
     )
 
     pnl_pct = (
-
         pnl
         / total_entry_cost
         * 100
-
         if total_entry_cost
         else 0
     )
@@ -1316,9 +1291,9 @@ def estimate_exit(
     }
 
 
-# ============================================================
-# PAPER ENTRY
-# ============================================================
+# =========================================================
+# PAPER BUY
+# =========================================================
 
 def open_trade(
     coin,
@@ -1330,27 +1305,27 @@ def open_trade(
         len(positions)
         >= MAX_OPEN_POSITIONS
     ):
-
         return None
 
-    address = coin[
-        "address"
-    ]
+    address = (
+        coin["address"]
+    )
 
-    if address in positions:
+    if (
+        address
+        in positions
+    ):
         return None
 
-    entry_quote = coin[
-        "price"
-    ]
+    quote = (
+        coin["price"]
+    )
 
-    if entry_quote <= 0:
+    if quote <= 0:
         return None
 
     simulated_entry = (
-
-        entry_quote
-
+        quote
         * (
             1
             + ENTRY_SLIPPAGE
@@ -1371,7 +1346,6 @@ def open_trade(
         paper_cash
         < total_required
     ):
-
         return None
 
     quantity = (
@@ -1400,7 +1374,7 @@ def open_trade(
             coin["liquidity"],
 
         "entry_quote":
-            entry_quote,
+            quote,
 
         "entry_price":
             simulated_entry,
@@ -1415,7 +1389,7 @@ def open_trade(
             quantity,
 
         "highest_quote":
-            entry_quote,
+            quote,
 
         "trailing":
             False,
@@ -1436,12 +1410,14 @@ def open_trade(
         address
     ] = time.time()
 
+    save_state()
+
     return position
 
 
-# ============================================================
-# PAPER EXIT
-# ============================================================
+# =========================================================
+# PAPER SELL
+# =========================================================
 
 def close_trade(
     address,
@@ -1496,12 +1472,14 @@ def close_trade(
         None,
     )
 
+    save_state()
+
     return trade
 
 
-# ============================================================
+# =========================================================
 # AUTOMATIC SNIPER
-# ============================================================
+# =========================================================
 
 async def sniper_job(
     context: ContextTypes.DEFAULT_TYPE,
@@ -1546,39 +1524,24 @@ async def sniper_job(
         else None
     )
 
-    scan_log.append(
-        {
-            "time":
-                last_scan_time,
-
-            "candidates":
-                len(rankings),
-
-            "best_score":
-                (
-                    rankings[0]["score"]
-                    if rankings
-                    else 0
-                ),
-        }
-    )
-
     if not rankings:
         return
 
+    best = (
+        rankings[0]
+    )
 
-    # --------------------------------------------------------
-    # WATCH BEST COIN
-    # --------------------------------------------------------
 
-    best = rankings[0]
+    # -----------------------------------------------------
+    # WATCH ALERT
+    # -----------------------------------------------------
 
     if (
         best["score"]
         >= WATCH_SCORE
     ):
 
-        last_alert = (
+        previous_alert = (
             recent_watch_alerts.get(
                 best["address"],
                 0,
@@ -1587,7 +1550,7 @@ async def sniper_job(
 
         if (
             time.time()
-            - last_alert
+            - previous_alert
             >= WATCH_COOLDOWN
         ):
 
@@ -1595,10 +1558,16 @@ async def sniper_job(
                 best["address"]
             ] = time.time()
 
+            reasons = ", ".join(
+                best["reasons"][:3]
+            )
+
+            risks = ", ".join(
+                best["risks"][:3]
+            )
+
             await context.bot.send_message(
-
                 chat_id=chat_id,
-
                 text=(
                     "🎯 NEW COIN WATCH\n\n"
 
@@ -1625,31 +1594,33 @@ async def sniper_job(
                     f"{best['sells_5m']}\n"
 
                     f"5m move: "
-                    f"{best['change_5m']:+.2f}%"
+                    f"{best['change_5m']:+.2f}%\n"
+
+                    f"Strengths: "
+                    f"{reasons or 'none'}\n"
+
+                    f"Risks: "
+                    f"{risks or 'none'}"
                 ),
             )
 
 
-    # --------------------------------------------------------
-    # MULTIPLE ENTRIES
-    # --------------------------------------------------------
+    # -----------------------------------------------------
+    # MULTIPLE PAPER ENTRIES
+    # -----------------------------------------------------
 
-    available_slots = (
-
+    slots = (
         MAX_OPEN_POSITIONS
         - len(positions)
     )
 
-    if available_slots <= 0:
+    if slots <= 0:
         return
 
     eligible = [
-
         coin
-
         for coin
         in rankings
-
         if (
             coin["score"]
             >= ENTRY_SCORE
@@ -1659,10 +1630,8 @@ async def sniper_job(
     if not eligible:
         return
 
-    # Can open more than one candidate from a single scan
-    # if several genuinely qualify.
     for coin in eligible[
-        :available_slots
+        :slots
     ]:
 
         position = (
@@ -1675,11 +1644,9 @@ async def sniper_job(
             continue
 
         await context.bot.send_message(
-
             chat_id=chat_id,
-
             text=(
-                "⚡🎯 PAPER SNIPE\n\n"
+                "⚡🎯 PAPER SNIPE OPENED\n\n"
 
                 f"{position['name']} "
                 f"({position['symbol']})\n"
@@ -1690,9 +1657,6 @@ async def sniper_job(
                 f"Paper stake: "
                 f"${position['trade_size']:.2f}\n"
 
-                f"Quote: "
-                f"${position['entry_quote']:.10f}\n"
-
                 f"Simulated entry: "
                 f"${position['entry_price']:.10f}\n"
 
@@ -1702,17 +1666,21 @@ async def sniper_job(
                 f"Liquidity: "
                 f"${position['liquidity']:,.0f}\n\n"
 
-                f"TP: +{TAKE_PROFIT:.1f}%\n"
-                f"SL: -{STOP_LOSS:.1f}%\n"
+                f"TP: "
+                f"+{TAKE_PROFIT:.1f}%\n"
+
+                f"SL: "
+                f"-{STOP_LOSS:.1f}%\n"
+
                 f"Max hold: "
                 f"{MAX_HOLD_MINUTES} min"
             ),
         )
 
 
-# ============================================================
+# =========================================================
 # POSITION MONITOR
-# ============================================================
+# =========================================================
 
 async def monitor_job(
     context: ContextTypes.DEFAULT_TYPE,
@@ -1757,9 +1725,9 @@ async def monitor_job(
             continue
 
 
-        # ----------------------------------------------------
-        # NEW HIGH
-        # ----------------------------------------------------
+        # -------------------------------------------------
+        # UPDATE HIGH
+        # -------------------------------------------------
 
         if (
             quote
@@ -1772,10 +1740,12 @@ async def monitor_job(
                 "highest_quote"
             ] = quote
 
+            save_state()
 
-        # ----------------------------------------------------
+
+        # -------------------------------------------------
         # CURRENT NET P/L
-        # ----------------------------------------------------
+        # -------------------------------------------------
 
         result = (
             estimate_exit(
@@ -1785,30 +1755,28 @@ async def monitor_job(
         )
 
         pnl_pct = (
-            result["pnl_pct"]
+            result[
+                "pnl_pct"
+            ]
         )
 
 
-        # ----------------------------------------------------
-        # ACTIVATE TRAILING
-        # ----------------------------------------------------
+        # -------------------------------------------------
+        # TRAILING STOP
+        # -------------------------------------------------
 
         high_gain = (
-
             (
                 position[
                     "highest_quote"
                 ]
-
                 - position[
                     "entry_quote"
                 ]
             )
-
             / position[
                 "entry_quote"
             ]
-
             * 100
         )
 
@@ -1821,49 +1789,39 @@ async def monitor_job(
                 "trailing"
             ] = True
 
-
-        # ----------------------------------------------------
-        # DRAWDOWN FROM HIGH
-        # ----------------------------------------------------
-
-        high = position[
-            "highest_quote"
-        ]
+        high = (
+            position[
+                "highest_quote"
+            ]
+        )
 
         drawdown = (
-
             (
                 quote
                 - high
             )
-
             / high
-
             * 100
-
             if high > 0
             else 0
         )
 
 
-        # ----------------------------------------------------
-        # AGE
-        # ----------------------------------------------------
+        # -------------------------------------------------
+        # TIME
+        # -------------------------------------------------
 
         held_minutes = (
-
             time.time()
-
             - position[
                 "opened_at"
             ]
-
         ) / 60
 
 
-        # ----------------------------------------------------
+        # -------------------------------------------------
         # EXIT DECISION
-        # ----------------------------------------------------
+        # -------------------------------------------------
 
         reason = None
 
@@ -1886,11 +1844,9 @@ async def monitor_job(
             )
 
         elif (
-
             position[
                 "trailing"
             ]
-
             and (
                 drawdown
                 <= -TRAIL_DISTANCE
@@ -1914,9 +1870,9 @@ async def monitor_job(
             continue
 
 
-        # ----------------------------------------------------
+        # -------------------------------------------------
         # CLOSE
-        # ----------------------------------------------------
+        # -------------------------------------------------
 
         trade = (
             close_trade(
@@ -1936,9 +1892,7 @@ async def monitor_job(
         )
 
         await context.bot.send_message(
-
             chat_id=chat_id,
-
             text=(
                 f"{icon} PAPER SNIPE CLOSED\n\n"
 
@@ -1960,9 +1914,9 @@ async def monitor_job(
         )
 
 
-# ============================================================
-# SCHEDULE JOBS
-# ============================================================
+# =========================================================
+# JOB SCHEDULER
+# =========================================================
 
 def schedule_jobs(
     job_queue,
@@ -1989,18 +1943,13 @@ def schedule_jobs(
     ):
 
         job_queue.run_repeating(
-
             sniper_job,
-
             interval=
                 SCAN_INTERVAL,
-
             first=
                 FIRST_SCAN_DELAY,
-
             chat_id=
                 chat_id,
-
             name=
                 sniper_name,
         )
@@ -2013,26 +1962,21 @@ def schedule_jobs(
     ):
 
         job_queue.run_repeating(
-
             monitor_job,
-
             interval=
                 MONITOR_INTERVAL,
-
             first=
                 MONITOR_INTERVAL,
-
             chat_id=
                 chat_id,
-
             name=
                 monitor_name,
         )
 
 
-# ============================================================
+# =========================================================
 # STARTUP
-# ============================================================
+# =========================================================
 
 async def post_init(
     application,
@@ -2058,25 +2002,19 @@ async def post_init(
         )
 
         await application.bot.send_message(
-
             chat_id=chat_id,
-
             text=(
-                "🎯 NEW COIN PAPER SNIPER ONLINE\n\n"
-
-                "Scan: every "
+                "🎯 PAPER SNIPER ONLINE\n\n"
+                f"Scan every: "
                 f"{SCAN_INTERVAL}s\n"
-
-                "Position check: every "
+                f"Monitor every: "
                 f"{MONITOR_INTERVAL}s\n"
-
-                "Max positions: "
+                f"Max positions: "
                 f"{MAX_OPEN_POSITIONS}\n"
-
-                "Stake: "
-                f"${TRADE_SIZE:.2f} each\n"
-
-                "Mode: PAPER MONEY"
+                f"Stake: "
+                f"${TRADE_SIZE:.2f}\n"
+                f"Paper cash: "
+                f"${paper_cash:.2f}"
             ),
         )
 
@@ -2088,9 +2026,9 @@ async def post_init(
         )
 
 
-# ============================================================
-# /START
-# ============================================================
+# =========================================================
+# COMMANDS
+# =========================================================
 
 async def start(
     update: Update,
@@ -2103,9 +2041,8 @@ async def start(
     )
 
     await update.message.reply_text(
-        "🎯 NEW COIN PAPER SNIPER\n\n"
+        "🎯 PAPER NEW-COIN SNIPER\n\n"
 
-        "Commands:\n"
         "/status\n"
         "/snipe\n"
         "/positions\n"
@@ -2118,10 +2055,6 @@ async def start(
     )
 
 
-# ============================================================
-# /CHATID
-# ============================================================
-
 async def chatid(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2132,10 +2065,6 @@ async def chatid(
         f"{update.effective_chat.id}"
     )
 
-
-# ============================================================
-# /STATUS
-# ============================================================
 
 async def status(
     update: Update,
@@ -2148,20 +2077,24 @@ async def status(
 
     if last_scan_time:
 
-        seconds = int(
+        age = int(
             time.time()
             - last_scan_time
         )
 
-        scan_status = (
-            f"{seconds}s ago"
+        scan_text = (
+            f"{age}s ago"
         )
 
     else:
 
-        scan_status = (
-            "waiting for first scan"
+        scan_text = (
+            "waiting"
         )
+
+    best = (
+        "none"
+    )
 
     if last_scan_best:
 
@@ -2170,24 +2103,14 @@ async def status(
             f"{last_scan_best['score']}/100"
         )
 
-    else:
-
-        best = "none"
-
     await update.message.reply_text(
         "🟢 SNIPER STATUS\n\n"
 
-        f"Jobs running: "
+        f"Jobs: "
         f"{len(jobs)}\n"
 
-        f"Scanner interval: "
-        f"{SCAN_INTERVAL}s\n"
-
-        f"Monitor interval: "
-        f"{MONITOR_INTERVAL}s\n"
-
         f"Last scan: "
-        f"{scan_status}\n"
+        f"{scan_text}\n"
 
         f"Candidates: "
         f"{last_scan_candidates}\n"
@@ -2195,14 +2118,14 @@ async def status(
         f"Best: "
         f"{best}\n\n"
 
-        f"Cash: "
+        f"Paper cash: "
         f"${paper_cash:.2f}\n"
 
-        f"Open positions: "
+        f"Open: "
         f"{len(positions)}/"
         f"{MAX_OPEN_POSITIONS}\n"
 
-        f"Completed trades: "
+        f"Closed: "
         f"{len(history)}\n\n"
 
         f"Entry score: "
@@ -2210,17 +2133,13 @@ async def status(
     )
 
 
-# ============================================================
-# /SNIPE
-# ============================================================
-
 async def snipe(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
     await update.message.reply_text(
-        "🎯 Running new-coin scan..."
+        "🎯 Running paper sniper scan..."
     )
 
     try:
@@ -2234,7 +2153,7 @@ async def snipe(
     except Exception as error:
 
         print(
-            "/snipe error:",
+            "snipe error:",
             repr(error),
         )
 
@@ -2247,8 +2166,7 @@ async def snipe(
     if not rankings:
 
         await update.message.reply_text(
-            "No new coins currently "
-            "pass the sniper filters."
+            "No new coins currently pass the filters."
         )
 
         return
@@ -2310,11 +2228,6 @@ async def snipe(
                     f"{coin['change_5m']:+.2f}%"
                 ),
 
-                (
-                    f"Token: "
-                    f"{coin['address']}"
-                ),
-
                 "",
             ]
         )
@@ -2323,10 +2236,6 @@ async def snipe(
         "\n".join(lines)[:4000]
     )
 
-
-# ============================================================
-# /POSITIONS
-# ============================================================
 
 async def positions_command(
     update: Update,
@@ -2346,7 +2255,7 @@ async def positions_command(
         "",
     ]
 
-    for position in list(
+    for position in (
         positions.values()
     ):
 
@@ -2363,6 +2272,10 @@ async def positions_command(
 
             quote = None
 
+        pnl_text = (
+            "price unavailable"
+        )
+
         if quote:
 
             result = (
@@ -2377,20 +2290,11 @@ async def positions_command(
                 f"(${result['pnl']:+.2f})"
             )
 
-        else:
-
-            pnl_text = (
-                "price unavailable"
-            )
-
         held = (
-
             time.time()
-
             - position[
                 "opened_at"
             ]
-
         ) / 60
 
         lines.extend(
@@ -2406,18 +2310,13 @@ async def positions_command(
                 ),
 
                 (
-                    f"Entry: "
-                    f"${position['entry_price']:.10f}"
-                ),
-
-                (
                     f"P/L: "
                     f"{pnl_text}"
                 ),
 
                 (
                     f"Held: "
-                    f"{held:.1f} min"
+                    f"{held:.1f}m"
                 ),
 
                 "",
@@ -2428,10 +2327,6 @@ async def positions_command(
         "\n".join(lines)[:4000]
     )
 
-
-# ============================================================
-# /ACCOUNT
-# ============================================================
 
 async def account(
     update: Update,
@@ -2457,11 +2352,9 @@ async def account(
     )
 
     win_rate = (
-
         wins
         / len(history)
         * 100
-
         if history
         else 0
     )
@@ -2469,7 +2362,7 @@ async def account(
     await update.message.reply_text(
         "💵 PAPER SNIPER ACCOUNT\n\n"
 
-        f"Starting balance: "
+        f"Starting: "
         f"${STARTING_BALANCE:.2f}\n"
 
         f"Cash: "
@@ -2495,10 +2388,6 @@ async def account(
     )
 
 
-# ============================================================
-# /HISTORY
-# ============================================================
-
 async def history_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2513,7 +2402,7 @@ async def history_command(
         return
 
     lines = [
-        "📚 RECENT SNIPES",
+        "📚 RECENT PAPER SNIPES",
         "",
     ]
 
@@ -2552,10 +2441,6 @@ async def history_command(
     )
 
 
-# ============================================================
-# /STATS
-# ============================================================
-
 async def stats(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2564,8 +2449,7 @@ async def stats(
     if not history:
 
         await update.message.reply_text(
-            "📊 No completed trades yet.\n"
-            "Let the paper sniper collect trades first."
+            "No completed trades yet."
         )
 
         return
@@ -2595,36 +2479,22 @@ async def stats(
         / len(returns)
     )
 
-    average_win = (
+    avg_win = (
         sum(winners)
         / len(winners)
         if winners
         else 0
     )
 
-    average_loss = (
+    avg_loss = (
         sum(losers)
         / len(losers)
         if losers
         else 0
     )
 
-    best = max(
-        returns
-    )
-
-    worst = min(
-        returns
-    )
-
-    total_pnl = sum(
-        trade["pnl"]
-        for trade
-        in history
-    )
-
     await update.message.reply_text(
-        "📊 SNIPER PERFORMANCE\n\n"
+        "📊 SNIPER STATS\n\n"
 
         f"Trades: "
         f"{len(history)}\n"
@@ -2633,27 +2503,26 @@ async def stats(
         f"{average:+.2f}%\n"
 
         f"Average winner: "
-        f"{average_win:+.2f}%\n"
+        f"{avg_win:+.2f}%\n"
 
         f"Average loser: "
-        f"{average_loss:+.2f}%\n"
+        f"{avg_loss:+.2f}%\n"
 
-        f"Best trade: "
-        f"{best:+.2f}%\n"
+        f"Best: "
+        f"{max(returns):+.2f}%\n"
 
-        f"Worst trade: "
-        f"{worst:+.2f}%\n"
-
-        f"Total realized: "
-        f"${total_pnl:+.2f}"
+        f"Worst: "
+        f"{min(returns):+.2f}%"
     )
 
 
-# ============================================================
+# =========================================================
 # MAIN
-# ============================================================
+# =========================================================
 
 def main():
+
+    load_state()
 
     application = (
         Application.builder()
@@ -2723,7 +2592,7 @@ def main():
     )
 
     print(
-        "NEW COIN PAPER SNIPER ONLINE"
+        "PAPER NEW-COIN SNIPER ONLINE"
     )
 
     application.run_polling(
