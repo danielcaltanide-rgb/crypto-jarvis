@@ -7,6 +7,10 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from openai import OpenAI
 
 
+# =========================================================
+# ENVIRONMENT
+# =========================================================
+
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
@@ -19,14 +23,13 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 AUTO_HUNT_INTERVAL = 300
 AUTO_HUNT_FIRST_SCAN = 60
+PAPER_MONITOR_INTERVAL = 30
 
 MIN_MARKET_CAP = 500_000
 MAX_MARKET_CAP = 25_000_000
-
 MIN_LIQUIDITY = 150_000
 MIN_VOLUME_24H = 500_000
 MIN_VOLUME_1H = 25_000
-
 MIN_SCORE = 55
 
 MAX_TOKEN_AGE_DAYS = 30
@@ -35,7 +38,26 @@ REQUEST_TIMEOUT = 15
 
 
 # =========================================================
-# HTTP HELPER
+# PAPER TRADING SETTINGS
+# =========================================================
+
+PAPER_STARTING_BALANCE = 1000.00
+PAPER_TRADE_SIZE = 50.00
+
+PAPER_MIN_ENTRY_SCORE = 70
+
+TAKE_PROFIT_PERCENT = 5.0
+STOP_LOSS_PERCENT = 2.0
+
+MAX_OPEN_POSITIONS = 1
+
+paper_balance = PAPER_STARTING_BALANCE
+paper_positions = {}
+paper_trade_history = []
+
+
+# =========================================================
+# HTTP
 # =========================================================
 
 def get_json(url, params=None):
@@ -46,7 +68,6 @@ def get_json(url, params=None):
     )
 
     response.raise_for_status()
-
     return response.json()
 
 
@@ -75,11 +96,6 @@ def get_coin(coin):
 # =========================================================
 
 def collect_solana_token_addresses():
-    """
-    Build a broader candidate universe from multiple
-    DexScreener discovery feeds.
-    """
-
     endpoints = [
         "https://api.dexscreener.com/token-profiles/latest/v1",
         "https://api.dexscreener.com/token-boosts/latest/v1",
@@ -94,7 +110,7 @@ def collect_solana_token_addresses():
         try:
             items = get_json(url)
         except requests.RequestException as error:
-            print("Discovery feed error:", url, error)
+            print("Discovery error:", error)
             continue
 
         if not isinstance(items, list):
@@ -106,10 +122,7 @@ def collect_solana_token_addresses():
 
             address = item.get("tokenAddress")
 
-            if not address:
-                continue
-
-            if address in seen:
+            if not address or address in seen:
                 continue
 
             seen.add(address)
@@ -124,13 +137,6 @@ def chunked(items, size):
 
 
 def get_solana_candidates():
-    """
-    Fetch pools for discovered Solana token addresses.
-
-    DexScreener supports up to 30 comma-separated
-    token addresses per request.
-    """
-
     addresses = collect_solana_token_addresses()
 
     if not addresses:
@@ -152,12 +158,9 @@ def get_solana_candidates():
             print("Pair batch error:", error)
             continue
 
-        if not isinstance(pairs, list):
-            continue
+        if isinstance(pairs, list):
+            all_pairs.extend(pairs)
 
-        all_pairs.extend(pairs)
-
-    # Keep the most liquid pool for each base token.
     best_pairs = {}
 
     for pair in all_pairs:
@@ -181,64 +184,34 @@ def get_solana_candidates():
             best_pairs[address] = pair
             continue
 
-        existing_liquidity = (
+        old_liquidity = (
             (existing.get("liquidity") or {}).get("usd")
             or 0
         )
 
-        if liquidity > existing_liquidity:
+        if liquidity > old_liquidity:
             best_pairs[address] = pair
 
     candidates = []
-
     now_ms = int(time.time() * 1000)
 
     for address, pair in best_pairs.items():
-        liquidity = (
-            (pair.get("liquidity") or {}).get("usd")
-            or 0
-        )
-
         volume = pair.get("volume") or {}
-
-        volume_24h = volume.get("h24") or 0
-        volume_6h = volume.get("h6") or 0
-        volume_1h = volume.get("h1") or 0
-
         txns = pair.get("txns") or {}
+        price_change = pair.get("priceChange") or {}
 
         txns_1h = txns.get("h1") or {}
         txns_6h = txns.get("h6") or {}
-
-        buys_1h = txns_1h.get("buys") or 0
-        sells_1h = txns_1h.get("sells") or 0
-
-        buys_6h = txns_6h.get("buys") or 0
-        sells_6h = txns_6h.get("sells") or 0
-
-        price_change = pair.get("priceChange") or {}
-
-        price_change_1h = price_change.get("h1") or 0
-        price_change_6h = price_change.get("h6") or 0
-        price_change_24h = price_change.get("h24") or 0
-
-        market_cap = (
-            pair.get("marketCap")
-            or pair.get("fdv")
-            or 0
-        )
 
         pair_created_at = pair.get("pairCreatedAt")
 
         age_hours = None
 
         if pair_created_at:
-            age_ms = max(
+            age_hours = max(
                 0,
                 now_ms - int(pair_created_at),
-            )
-
-            age_hours = age_ms / 3_600_000
+            ) / 3_600_000
 
         base = pair.get("baseToken") or {}
 
@@ -247,20 +220,27 @@ def get_solana_candidates():
                 "name": base.get("name") or "Unknown",
                 "symbol": base.get("symbol") or "?",
                 "address": address,
-                "market_cap": market_cap,
-                "liquidity": liquidity,
-                "volume_24h": volume_24h,
-                "volume_6h": volume_6h,
-                "volume_1h": volume_1h,
-                "buys_1h": buys_1h,
-                "sells_1h": sells_1h,
-                "buys_6h": buys_6h,
-                "sells_6h": sells_6h,
-                "price_change_1h": price_change_1h,
-                "price_change_6h": price_change_6h,
-                "price_change_24h": price_change_24h,
+                "price": float(pair.get("priceUsd") or 0),
+                "market_cap": (
+                    pair.get("marketCap")
+                    or pair.get("fdv")
+                    or 0
+                ),
+                "liquidity": (
+                    (pair.get("liquidity") or {}).get("usd")
+                    or 0
+                ),
+                "volume_24h": volume.get("h24") or 0,
+                "volume_6h": volume.get("h6") or 0,
+                "volume_1h": volume.get("h1") or 0,
+                "buys_1h": txns_1h.get("buys") or 0,
+                "sells_1h": txns_1h.get("sells") or 0,
+                "buys_6h": txns_6h.get("buys") or 0,
+                "sells_6h": txns_6h.get("sells") or 0,
+                "price_change_1h": price_change.get("h1") or 0,
+                "price_change_6h": price_change.get("h6") or 0,
+                "price_change_24h": price_change.get("h24") or 0,
                 "age_hours": age_hours,
-                "pair_url": pair.get("url") or "",
                 "dex_id": pair.get("dexId") or "",
             }
         )
@@ -269,7 +249,38 @@ def get_solana_candidates():
 
 
 # =========================================================
-# JARVIS SCORING
+# LIVE PRICE LOOKUP FOR PAPER POSITIONS
+# =========================================================
+
+def get_token_price(address):
+    url = (
+        "https://api.dexscreener.com/tokens/v1/"
+        f"solana/{address}"
+    )
+
+    pairs = get_json(url)
+
+    if not isinstance(pairs, list) or not pairs:
+        return None
+
+    pair = max(
+        pairs,
+        key=lambda x: (
+            (x.get("liquidity") or {}).get("usd")
+            or 0
+        ),
+    )
+
+    price = pair.get("priceUsd")
+
+    if not price:
+        return None
+
+    return float(price)
+
+
+# =========================================================
+# SCORING
 # =========================================================
 
 def score_candidate(c):
@@ -279,16 +290,11 @@ def score_candidate(c):
 
     mc = c["market_cap"]
     liq = c["liquidity"]
-
     vol24 = c["volume_24h"]
-    vol6 = c["volume_6h"]
     vol1 = c["volume_1h"]
 
     buys1 = c["buys_1h"]
     sells1 = c["sells_1h"]
-
-    buys6 = c["buys_6h"]
-    sells6 = c["sells_6h"]
 
     change1 = c["price_change_1h"]
     change6 = c["price_change_6h"]
@@ -296,334 +302,167 @@ def score_candidate(c):
 
     age_hours = c["age_hours"]
 
-
-    # -----------------------------------------------------
-    # TOKEN AGE
-    # -----------------------------------------------------
-
     if age_hours is not None:
         if age_hours < 1:
             score -= 12
             risks.append("extremely new pair")
-
-        elif age_hours < 6:
-            score += 3
-            positives.append("very early")
-
         elif age_hours < 72:
             score += 7
             positives.append("early-stage pair")
-
         elif age_hours <= 24 * 14:
             score += 4
-
-
-    # -----------------------------------------------------
-    # MARKET CAP
-    # -----------------------------------------------------
 
     if 1_000_000 <= mc <= 10_000_000:
         score += 20
         positives.append("strong market-cap zone")
-
     elif 500_000 <= mc <= 25_000_000:
         score += 12
-
-    else:
-        risks.append("market cap outside target")
-
-
-    # -----------------------------------------------------
-    # LIQUIDITY
-    # -----------------------------------------------------
 
     if liq >= 1_000_000:
         score += 20
         positives.append("strong liquidity")
-
     elif liq >= 500_000:
         score += 16
-
     elif liq >= 250_000:
         score += 11
-
     elif liq >= 150_000:
         score += 6
 
-    else:
-        risks.append("low liquidity")
-
-
-    # -----------------------------------------------------
-    # 24H VOLUME
-    # -----------------------------------------------------
-
     if vol24 >= 10_000_000:
         score += 14
-        positives.append("very high volume")
-
     elif vol24 >= 5_000_000:
         score += 12
-
     elif vol24 >= 2_000_000:
         score += 9
-
     elif vol24 >= 500_000:
         score += 5
 
-    else:
-        risks.append("weak 24h volume")
-
-
-    # -----------------------------------------------------
-    # RECENT VOLUME ACCELERATION
-    # -----------------------------------------------------
-
-    expected_hourly = (
-        vol24 / 24
-        if vol24
-        else 0
-    )
+    expected_hourly = vol24 / 24 if vol24 else 0
 
     if expected_hourly:
-        volume_ratio = vol1 / expected_hourly
+        ratio = vol1 / expected_hourly
 
-        if volume_ratio >= 4:
+        if ratio >= 4:
             score += 18
-            positives.append(
-                "strong 1h volume acceleration"
-            )
-
-        elif volume_ratio >= 2:
+            positives.append("strong volume acceleration")
+        elif ratio >= 2:
             score += 13
-            positives.append(
-                "volume accelerating"
-            )
-
-        elif volume_ratio >= 1.25:
+        elif ratio >= 1.25:
             score += 7
-
-        elif volume_ratio < 0.35:
+        elif ratio < 0.35:
             score -= 8
-            risks.append("1h volume fading")
-
-
-    # -----------------------------------------------------
-    # 1H BUY / SELL PRESSURE
-    # -----------------------------------------------------
+            risks.append("volume fading")
 
     if buys1 + sells1 >= 30:
         if sells1 == 0:
             score += 14
-            positives.append(
-                "very strong buy pressure"
-            )
-
         else:
-            ratio1 = buys1 / sells1
+            buy_ratio = buys1 / sells1
 
-            if ratio1 >= 2.5:
+            if buy_ratio >= 2.5:
                 score += 14
-                positives.append(
-                    "strong buy pressure"
-                )
-
-            elif ratio1 >= 1.6:
+                positives.append("strong buy pressure")
+            elif buy_ratio >= 1.6:
                 score += 11
-
-            elif ratio1 >= 1.2:
+            elif buy_ratio >= 1.2:
                 score += 6
-
-            elif ratio1 < 0.75:
+            elif buy_ratio < 0.75:
                 score -= 10
-                risks.append(
-                    "sell pressure dominates"
-                )
-
-
-    # -----------------------------------------------------
-    # 6H BUY / SELL PRESSURE
-    # -----------------------------------------------------
-
-    if buys6 + sells6 >= 50:
-        if sells6 == 0:
-            score += 5
-
-        else:
-            ratio6 = buys6 / sells6
-
-            if ratio6 >= 1.5:
-                score += 5
-
-            elif ratio6 < 0.8:
-                score -= 6
-                risks.append(
-                    "6h selling pressure"
-                )
-
-
-    # -----------------------------------------------------
-    # PRICE ACTION
-    # -----------------------------------------------------
+                risks.append("sell pressure dominates")
 
     if 2 <= change1 <= 18:
         score += 9
-        positives.append(
-            "healthy short-term momentum"
-        )
-
+        positives.append("healthy short-term momentum")
     elif 18 < change1 <= 35:
         score += 4
-
     elif change1 > 60:
         score -= 20
         risks.append("extreme 1h pump")
-
     elif change1 > 35:
         score -= 10
         risks.append("already extended")
-
     elif change1 < -25:
         score -= 18
         risks.append("sharp 1h decline")
 
-    elif change1 < -12:
-        score -= 8
-        risks.append(
-            "weak short-term momentum"
-        )
-
-
-    if -5 <= change6 <= 35:
-        score += 4
-
-    elif change6 > 100:
+    if change6 > 100:
         score -= 12
-        risks.append("extreme 6h move")
-
     elif change6 < -35:
         score -= 12
-        risks.append("heavy 6h decline")
-
 
     if change24 > 250:
         score -= 15
-        risks.append("extreme 24h pump")
-
     elif change24 < -60:
         score -= 15
-        risks.append("major 24h decline")
-
-
-    # -----------------------------------------------------
-    # LIQUIDITY / MARKET CAP RATIO
-    # -----------------------------------------------------
 
     if mc and liq:
         liquidity_ratio = liq / mc
 
         if liquidity_ratio >= 0.20:
             score += 8
-            positives.append(
-                "healthy liquidity ratio"
-            )
-
         elif liquidity_ratio >= 0.08:
             score += 4
-
         elif liquidity_ratio < 0.025:
             score -= 15
-            risks.append(
-                "thin liquidity vs valuation"
-            )
+            risks.append("thin liquidity vs valuation")
 
-
-    score = max(
-        0,
-        min(100, score),
-    )
+    score = max(0, min(100, score))
 
     if score >= 82:
         label = "🔥 STRONG WATCH"
-
     elif score >= 70:
         label = "👀 WATCH"
-
     elif score >= 55:
         label = "⚠️ SPECULATIVE"
-
     else:
         label = "WEAK SETUP"
 
-    return (
-        score,
-        label,
-        risks,
-        positives,
-    )
+    return score, label, risks, positives
 
 
 # =========================================================
-# BUILD HUNT MESSAGE
+# FILTER + RANK
 # =========================================================
 
-def build_hunt_message():
+def get_ranked_candidates():
     candidates = get_solana_candidates()
-
     results = []
 
     for candidate in candidates:
+        if candidate["market_cap"] < MIN_MARKET_CAP:
+            continue
 
-        mc = candidate["market_cap"]
-        liq = candidate["liquidity"]
-        vol24 = candidate["volume_24h"]
-        vol1 = candidate["volume_1h"]
+        if candidate["market_cap"] > MAX_MARKET_CAP:
+            continue
+
+        if candidate["liquidity"] < MIN_LIQUIDITY:
+            continue
+
+        if candidate["volume_24h"] < MIN_VOLUME_24H:
+            continue
+
+        if candidate["volume_1h"] < MIN_VOLUME_1H:
+            continue
+
+        if candidate["price"] <= 0:
+            continue
+
         age = candidate["age_hours"]
 
-
-        # -------------------------------------------------
-        # HARD FILTERS
-        # -------------------------------------------------
-
-        if mc < MIN_MARKET_CAP:
+        if age is not None and age > MAX_TOKEN_AGE_DAYS * 24:
             continue
 
-        if mc > MAX_MARKET_CAP:
-            continue
-
-        if liq < MIN_LIQUIDITY:
-            continue
-
-        if vol24 < MIN_VOLUME_24H:
-            continue
-
-        if vol1 < MIN_VOLUME_1H:
-            continue
-
-        if age is not None:
-            if age > MAX_TOKEN_AGE_DAYS * 24:
-                continue
-
-
-        (
-            score,
-            risk,
-            risks,
-            positives,
-        ) = score_candidate(candidate)
-
+        score, label, risks, positives = score_candidate(candidate)
 
         if score < MIN_SCORE:
             continue
 
-
         candidate["score"] = score
-        candidate["risk"] = risk
+        candidate["label"] = label
         candidate["risks"] = risks
         candidate["positives"] = positives
 
         results.append(candidate)
-
 
     results.sort(
         key=lambda x: (
@@ -634,110 +473,191 @@ def build_hunt_message():
         reverse=True,
     )
 
+    return results
 
+
+# =========================================================
+# PAPER BUY
+# =========================================================
+
+def paper_buy(candidate):
+    global paper_balance
+
+    if len(paper_positions) >= MAX_OPEN_POSITIONS:
+        return None
+
+    if paper_balance < PAPER_TRADE_SIZE:
+        return None
+
+    price = candidate["price"]
+
+    if price <= 0:
+        return None
+
+    quantity = PAPER_TRADE_SIZE / price
+
+    position = {
+        "address": candidate["address"],
+        "name": candidate["name"],
+        "symbol": candidate["symbol"],
+        "entry_price": price,
+        "quantity": quantity,
+        "cost": PAPER_TRADE_SIZE,
+        "score": candidate["score"],
+        "opened_at": time.time(),
+    }
+
+    paper_positions[candidate["address"]] = position
+
+    paper_balance -= PAPER_TRADE_SIZE
+
+    return position
+
+
+# =========================================================
+# PAPER SELL
+# =========================================================
+
+def paper_sell(address, current_price, reason):
+    global paper_balance
+
+    position = paper_positions.get(address)
+
+    if not position:
+        return None
+
+    proceeds = position["quantity"] * current_price
+    pnl = proceeds - position["cost"]
+
+    pnl_percent = (
+        pnl / position["cost"]
+    ) * 100
+
+    paper_balance += proceeds
+
+    trade = {
+        **position,
+        "exit_price": current_price,
+        "proceeds": proceeds,
+        "pnl": pnl,
+        "pnl_percent": pnl_percent,
+        "reason": reason,
+        "closed_at": time.time(),
+    }
+
+    paper_trade_history.append(trade)
+
+    del paper_positions[address]
+
+    return trade
+
+
+# =========================================================
+# PAPER POSITION MONITOR
+# =========================================================
+
+async def monitor_paper_positions(
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not paper_positions:
+        return
+
+    chat_id = context.job.chat_id
+
+    for address in list(paper_positions.keys()):
+        position = paper_positions.get(address)
+
+        if not position:
+            continue
+
+        try:
+            current_price = get_token_price(address)
+        except Exception as error:
+            print("Price-monitor error:", error)
+            continue
+
+        if current_price is None:
+            continue
+
+        entry = position["entry_price"]
+
+        change_percent = (
+            (current_price - entry) / entry
+        ) * 100
+
+        reason = None
+
+        if change_percent >= TAKE_PROFIT_PERCENT:
+            reason = "TAKE PROFIT"
+
+        elif change_percent <= -STOP_LOSS_PERCENT:
+            reason = "STOP LOSS"
+
+        if reason:
+            trade = paper_sell(
+                address,
+                current_price,
+                reason,
+            )
+
+            if trade and chat_id:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"📤 PAPER SELL\n\n"
+                        f"{trade['name']} "
+                        f"({trade['symbol']})\n"
+                        f"Reason: {trade['reason']}\n"
+                        f"Entry: ${trade['entry_price']:.10f}\n"
+                        f"Exit: ${trade['exit_price']:.10f}\n"
+                        f"P/L: ${trade['pnl']:.2f} "
+                        f"({trade['pnl_percent']:.2f}%)\n"
+                        f"Paper balance: ${paper_balance:.2f}"
+                    ),
+                )
+
+
+# =========================================================
+# HUNT MESSAGE
+# =========================================================
+
+def build_hunt_message(results):
     top = results[:5]
-
 
     if not top:
         return (
             "🔎 JARVIS SOLANA HUNT\n\n"
-            "No tokens currently meet Jarvis's "
-            "stronger filters.\n\n"
-            "Jarvis will wait rather than force "
-            "a weak setup."
+            "No tokens currently meet Jarvis's filters."
         )
-
 
     lines = [
         "🚨 JARVIS SOLANA HUNT",
         "",
-        "Broader discovery + strict screening.",
-        "Screening only — not financial advice.",
+        "Paper-trading mode.",
         "",
     ]
 
-
     for i, c in enumerate(top, 1):
-
-        sells = c["sells_1h"]
-
-        if sells:
-            pressure = (
-                c["buys_1h"] / sells
-            )
-
-            pressure_text = (
-                f"{pressure:.2f}x"
-            )
-
-        elif c["buys_1h"]:
-            pressure_text = "buy-heavy"
-
-        else:
-            pressure_text = "N/A"
-
-
-        age_hours = c["age_hours"]
-
-        if age_hours is None:
-            age_text = "Unknown"
-
-        elif age_hours < 24:
-            age_text = (
-                f"{age_hours:.1f} hours"
-            )
-
-        else:
-            age_text = (
-                f"{age_hours / 24:.1f} days"
-            )
-
-
-        risks = (
-            ", ".join(c["risks"][:3])
-            if c["risks"]
-            else "none from current screen"
-        )
-
-
-        strengths = (
-            ", ".join(
-                c["positives"][:3]
-            )
-            if c["positives"]
-            else "none"
-        )
-
-
         lines.extend(
             [
                 f"{i}. {c['name']} ({c['symbol']})",
-                f"Jarvis Score: {c['score']}/100",
-                f"Signal: {c['risk']}",
-                f"Age: {age_text}",
-                f"DEX: {c['dex_id']}",
+                f"Score: {c['score']}/100",
+                f"Signal: {c['label']}",
+                f"Price: ${c['price']:.10f}",
                 f"Market cap: ${c['market_cap']:,.0f}",
                 f"Liquidity: ${c['liquidity']:,.0f}",
                 f"24h volume: ${c['volume_24h']:,.0f}",
-                f"6h volume: ${c['volume_6h']:,.0f}",
                 f"1h volume: ${c['volume_1h']:,.0f}",
-                f"1h buy pressure: {pressure_text}",
-                f"1h change: {c['price_change_1h']:.1f}%",
-                f"6h change: {c['price_change_6h']:.1f}%",
-                f"24h change: {c['price_change_24h']:.1f}%",
-                f"Strengths: {strengths}",
-                f"Flags: {risks}",
                 f"Token: {c['address']}",
                 "",
             ]
         )
 
-
     return "\n".join(lines)[:4000]
 
 
 # =========================================================
-# AUTOMATIC HUNT
+# AUTOMATIC HUNT + PAPER ENTRY
 # =========================================================
 
 async def auto_hunt(
@@ -749,26 +669,48 @@ async def auto_hunt(
         return
 
     try:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "🔎 Jarvis automatic "
-                "scan starting..."
-            ),
-        )
-
-        message = build_hunt_message()
+        results = get_ranked_candidates()
 
         await context.bot.send_message(
             chat_id=chat_id,
-            text=message,
+            text=build_hunt_message(results),
         )
+
+        if paper_positions:
+            return
+
+        entry_candidates = [
+            c
+            for c in results
+            if c["score"] >= PAPER_MIN_ENTRY_SCORE
+        ]
+
+        if not entry_candidates:
+            return
+
+        candidate = entry_candidates[0]
+
+        position = paper_buy(candidate)
+
+        if position:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"📥 PAPER BUY\n\n"
+                    f"{position['name']} "
+                    f"({position['symbol']})\n"
+                    f"Score: {position['score']}/100\n"
+                    f"Entry: ${position['entry_price']:.10f}\n"
+                    f"Size: ${position['cost']:.2f}\n"
+                    f"Take profit: +{TAKE_PROFIT_PERCENT:.1f}%\n"
+                    f"Stop loss: -{STOP_LOSS_PERCENT:.1f}%\n"
+                    f"Paper balance remaining: "
+                    f"${paper_balance:.2f}"
+                ),
+            )
 
     except Exception as error:
-        print(
-            "Auto-hunt error:",
-            repr(error),
-        )
+        print("Auto-hunt error:", repr(error))
 
 
 # =========================================================
@@ -782,39 +724,150 @@ async def start(
     chat_id = update.effective_chat.id
 
     await update.message.reply_text(
-        "🤖 Crypto Jarvis online.\n\n"
+        "🤖 Crypto Jarvis PAPER SCALPER online.\n\n"
         "Commands:\n"
+        "/hunt\n"
+        "/paper\n"
+        "/positions\n"
+        "/history\n"
         "/price bitcoin\n"
-        "/analyse bitcoin\n"
-        "/hunt"
+        "/analyse bitcoin"
     )
 
+    hunt_name = f"auto_hunt_{chat_id}"
+    monitor_name = f"paper_monitor_{chat_id}"
 
-    job_name = (
-        f"auto_hunt_{chat_id}"
-    )
-
-
-    existing_jobs = (
-        context.job_queue
-        .get_jobs_by_name(job_name)
-    )
-
-
-    if not existing_jobs:
+    if not context.job_queue.get_jobs_by_name(hunt_name):
         context.job_queue.run_repeating(
             auto_hunt,
             interval=AUTO_HUNT_INTERVAL,
             first=AUTO_HUNT_FIRST_SCAN,
             chat_id=chat_id,
-            name=job_name,
+            name=hunt_name,
         )
 
+    if not context.job_queue.get_jobs_by_name(monitor_name):
+        context.job_queue.run_repeating(
+            monitor_paper_positions,
+            interval=PAPER_MONITOR_INTERVAL,
+            first=PAPER_MONITOR_INTERVAL,
+            chat_id=chat_id,
+            name=monitor_name,
+        )
+
+    await update.message.reply_text(
+        "✅ Paper scalping activated.\n"
+        "No real money will be used."
+    )
+
+
+async def paper(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    total_pnl = sum(
+        trade["pnl"]
+        for trade in paper_trade_history
+    )
+
+    await update.message.reply_text(
+        f"💵 PAPER ACCOUNT\n\n"
+        f"Cash: ${paper_balance:.2f}\n"
+        f"Open positions: {len(paper_positions)}\n"
+        f"Closed trades: {len(paper_trade_history)}\n"
+        f"Realized P/L: ${total_pnl:.2f}"
+    )
+
+
+async def positions(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not paper_positions:
         await update.message.reply_text(
-            "✅ Automatic hunt activated.\n"
-            "First automatic scan in about "
-            "1 minute.\n"
-            "Then every 5 minutes."
+            "No paper positions are currently open."
+        )
+        return
+
+    lines = ["📊 OPEN PAPER POSITIONS", ""]
+
+    for position in paper_positions.values():
+        try:
+            current_price = get_token_price(
+                position["address"]
+            )
+        except Exception:
+            current_price = None
+
+        if current_price:
+            pnl_percent = (
+                (current_price - position["entry_price"])
+                / position["entry_price"]
+            ) * 100
+        else:
+            pnl_percent = 0
+
+        lines.extend(
+            [
+                f"{position['name']} ({position['symbol']})",
+                f"Entry: ${position['entry_price']:.10f}",
+                f"Current P/L: {pnl_percent:.2f}%",
+                "",
+            ]
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+
+
+async def history(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not paper_trade_history:
+        await update.message.reply_text(
+            "No completed paper trades yet."
+        )
+        return
+
+    lines = ["📚 PAPER TRADE HISTORY", ""]
+
+    for trade in paper_trade_history[-10:]:
+        lines.extend(
+            [
+                f"{trade['symbol']}: "
+                f"{trade['pnl_percent']:+.2f}%",
+                f"Exit: {trade['reason']}",
+                "",
+            ]
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+
+
+async def hunt(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        "🔎 Jarvis is scanning..."
+    )
+
+    try:
+        results = get_ranked_candidates()
+
+        await update.message.reply_text(
+            build_hunt_message(results)
+        )
+
+    except Exception as error:
+        print("Hunt error:", repr(error))
+
+        await update.message.reply_text(
+            "Jarvis hunt encountered an error."
         )
 
 
@@ -828,55 +881,26 @@ async def price(
         )
         return
 
-
-    coin = context.args[0]
-
-
     try:
-        data = get_coin(coin)
+        data = get_coin(context.args[0])
 
-    except requests.RequestException:
+        if not data:
+            await update.message.reply_text(
+                "Coin not found."
+            )
+            return
+
         await update.message.reply_text(
-            "Market data is temporarily "
-            "unavailable."
+            f"🪙 {data['name']}\n\n"
+            f"Price: ${data['current_price']:,}\n"
+            f"Market cap: ${data['market_cap']:,}\n"
+            f"24h volume: ${data['total_volume']:,}"
         )
-        return
 
-
-    if not data:
+    except Exception:
         await update.message.reply_text(
-            "Coin not found."
+            "Market data unavailable."
         )
-        return
-
-
-    change = data.get(
-        "price_change_percentage_24h"
-    )
-
-
-    change_text = (
-        f"{change:.2f}%"
-        if change is not None
-        else "N/A"
-    )
-
-
-    text = (
-        f"🪙 {data['name']} "
-        f"({data['symbol'].upper()})\n\n"
-        f"Price: ${data['current_price']:,}\n"
-        f"24h change: {change_text}\n"
-        f"Market cap: "
-        f"${data['market_cap']:,}\n"
-        f"24h volume: "
-        f"${data['total_volume']:,}"
-    )
-
-
-    await update.message.reply_text(
-        text
-    )
 
 
 async def analyse(
@@ -889,117 +913,45 @@ async def analyse(
         )
         return
 
-
-    coin = context.args[0]
-
-
     try:
-        data = get_coin(coin)
+        data = get_coin(context.args[0])
 
-    except requests.RequestException:
-        await update.message.reply_text(
-            "Market data is temporarily "
-            "unavailable."
-        )
-        return
+        if not data:
+            await update.message.reply_text(
+                "Coin not found."
+            )
+            return
 
+        prompt = f"""
+Analyze this cryptocurrency cautiously.
 
-    if not data:
-        await update.message.reply_text(
-            "Coin not found."
-        )
-        return
+Name: {data['name']}
+Price: {data['current_price']}
+24h change: {data['price_change_percentage_24h']}
+Market cap: {data['market_cap']}
+24h volume: {data['total_volume']}
 
-
-    prompt = f"""
-You are Crypto Jarvis, a cautious crypto analyst.
-
-Coin: {data['name']}
-Price: ${data['current_price']}
-24h change: {data['price_change_percentage_24h']}%
-Market cap: ${data['market_cap']}
-24h volume: ${data['total_volume']}
-
-Give a concise analysis covering:
-
-1. Momentum
-2. Volume
-3. Risk
-4. What would strengthen the setup
-5. What would invalidate the setup
-
-Never guarantee profits.
-Never claim a coin will 10x.
-Use only the supplied market data.
+Discuss momentum, volume, and risks.
+Do not guarantee profit.
 """
 
-
-    try:
-        response = (
-            client.responses.create(
-                model="gpt-5-mini",
-                input=prompt,
-            )
-        )
-
-
-        await update.message.reply_text(
-            "🧠 JARVIS ANALYSIS\n\n"
-            + response.output_text
-        )
-
-
-    except Exception as error:
-        print(
-            "Analysis error:",
-            repr(error),
+        response = client.responses.create(
+            model="gpt-5-mini",
+            input=prompt,
         )
 
         await update.message.reply_text(
-            "Jarvis AI analysis is "
-            "temporarily unavailable."
+            response.output_text
         )
 
-
-async def hunt(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    await update.message.reply_text(
-        "🔎 Jarvis is scanning a broader "
-        "Solana candidate pool..."
-    )
-
-
-    try:
-        message = build_hunt_message()
-
+    except Exception:
         await update.message.reply_text(
-            message
-        )
-
-
-    except requests.RequestException:
-        await update.message.reply_text(
-            "DEX market data is temporarily "
-            "unavailable."
-        )
-
-
-    except Exception as error:
-        print(
-            "Hunt error:",
-            repr(error),
-        )
-
-        await update.message.reply_text(
-            "Jarvis hunt encountered "
-            "an error."
+            "Analysis unavailable."
         )
 
 
 # =========================================================
-# RUN BOT
+# RUN
 # =========================================================
 
 def main():
@@ -1009,43 +961,15 @@ def main():
         .build()
     )
 
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("hunt", hunt))
+    app.add_handler(CommandHandler("paper", paper))
+    app.add_handler(CommandHandler("positions", positions))
+    app.add_handler(CommandHandler("history", history))
+    app.add_handler(CommandHandler("price", price))
+    app.add_handler(CommandHandler("analyse", analyse))
 
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start,
-        )
-    )
-
-
-    app.add_handler(
-        CommandHandler(
-            "price",
-            price,
-        )
-    )
-
-
-    app.add_handler(
-        CommandHandler(
-            "analyse",
-            analyse,
-        )
-    )
-
-
-    app.add_handler(
-        CommandHandler(
-            "hunt",
-            hunt,
-        )
-    )
-
-
-    print(
-        "Crypto Jarvis online"
-    )
-
+    print("Crypto Jarvis paper scalper online")
 
     app.run_polling()
 
