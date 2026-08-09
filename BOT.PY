@@ -26,7 +26,6 @@ REQUEST_TIMEOUT = 15
 AUTO_HUNT_INTERVAL = 300
 AUTO_HUNT_FIRST_SCAN = 60
 
-# Check open paper positions every 30 seconds
 PAPER_MONITOR_INTERVAL = 30
 
 
@@ -37,15 +36,13 @@ PAPER_MONITOR_INTERVAL = 30
 PAPER_STARTING_BALANCE = 1000.00
 PAPER_TRADE_SIZE = 50.00
 
-# Softer threshold while TESTING paper trading
-PAPER_MIN_ENTRY_SCORE = 55
+# Looser threshold for paper testing
+PAPER_MIN_ENTRY_SCORE = 45
 
 TAKE_PROFIT_PERCENT = 5.0
 STOP_LOSS_PERCENT = 2.0
 
-# Close stale scalps after 60 minutes
 MAX_HOLD_MINUTES = 60
-
 MAX_OPEN_POSITIONS = 1
 
 paper_balance = PAPER_STARTING_BALANCE
@@ -54,20 +51,17 @@ paper_trade_history = []
 
 
 # =========================================================
-# PAPER-MODE SCANNER FILTERS
+# PAPER TEST SCANNER FILTERS
 # =========================================================
 
-# These are intentionally softer than before so we can
-# actually test simulated entries/exits.
+MIN_MARKET_CAP = 100_000
+MAX_MARKET_CAP = 50_000_000
 
-MIN_MARKET_CAP = 250_000
-MAX_MARKET_CAP = 30_000_000
+MIN_LIQUIDITY = 25_000
+MIN_VOLUME_24H = 100_000
+MIN_VOLUME_1H = 2_500
 
-MIN_LIQUIDITY = 75_000
-MIN_VOLUME_24H = 250_000
-MIN_VOLUME_1H = 10_000
-
-MIN_SCAN_SCORE = 45
+MIN_SCAN_SCORE = 35
 
 MAX_TOKEN_AGE_DAYS = 30
 
@@ -113,11 +107,6 @@ def get_coin(coin):
 # =========================================================
 
 def collect_solana_token_addresses():
-    """
-    Build a broader Solana candidate list from several
-    DexScreener discovery feeds.
-    """
-
     endpoints = [
         "https://api.dexscreener.com/token-profiles/latest/v1",
         "https://api.dexscreener.com/token-boosts/latest/v1",
@@ -170,7 +159,6 @@ def get_solana_candidates():
 
     all_pairs = []
 
-    # DexScreener accepts batches of token addresses.
     for batch in chunked(addresses, 30):
         joined = ",".join(batch)
 
@@ -189,7 +177,6 @@ def get_solana_candidates():
         if isinstance(pairs, list):
             all_pairs.extend(pairs)
 
-    # Keep the most liquid pool for each token.
     best_pairs = {}
 
     for pair in all_pairs:
@@ -222,7 +209,6 @@ def get_solana_candidates():
             best_pairs[address] = pair
 
     candidates = []
-
     now_ms = int(time.time() * 1000)
 
     for address, pair in best_pairs.items():
@@ -360,7 +346,7 @@ def score_candidate(c):
 
     if age is not None:
         if age < 1:
-            score -= 10
+            score -= 8
             risks.append("extremely new")
 
         elif age <= 72:
@@ -375,12 +361,12 @@ def score_candidate(c):
     # MARKET CAP
     # -----------------------------------------------------
 
-    if 750_000 <= mc <= 10_000_000:
+    if 500_000 <= mc <= 10_000_000:
         score += 20
         positives.append("good market-cap zone")
 
-    elif 250_000 <= mc <= 30_000_000:
-        score += 12
+    elif 100_000 <= mc <= 50_000_000:
+        score += 10
 
     else:
         risks.append("market cap outside target")
@@ -403,7 +389,7 @@ def score_candidate(c):
     elif liq >= 100_000:
         score += 8
 
-    elif liq >= 75_000:
+    elif liq >= 25_000:
         score += 4
 
     else:
@@ -423,7 +409,7 @@ def score_candidate(c):
     elif vol24 >= 1_000_000:
         score += 9
 
-    elif vol24 >= 250_000:
+    elif vol24 >= 100_000:
         score += 5
 
 
@@ -448,7 +434,7 @@ def score_candidate(c):
             score += 7
 
         elif acceleration < 0.35:
-            score -= 6
+            score -= 5
             risks.append("volume fading")
 
 
@@ -458,7 +444,7 @@ def score_candidate(c):
 
     trades1 = buys1 + sells1
 
-    if trades1 >= 20:
+    if trades1 >= 10:
         if sells1 == 0:
             score += 12
             positives.append("strong buy pressure")
@@ -477,7 +463,7 @@ def score_candidate(c):
                 score += 5
 
             elif ratio < 0.70:
-                score -= 10
+                score -= 8
                 risks.append("selling pressure")
 
 
@@ -510,7 +496,7 @@ def score_candidate(c):
 
 
     # -----------------------------------------------------
-    # BIGGER-TIMEFRAME EXTREMES
+    # BIGGER TIMEFRAME EXTREMES
     # -----------------------------------------------------
 
     if change6 > 120:
@@ -554,7 +540,7 @@ def score_candidate(c):
     elif score >= 65:
         label = "👀 WATCH"
 
-    elif score >= 45:
+    elif score >= 35:
         label = "⚠️ SPECULATIVE"
 
     else:
@@ -797,13 +783,13 @@ def build_hunt_message(results):
         return (
             "🔎 JARVIS SOLANA HUNT\n\n"
             "No tokens currently meet "
-            "Jarvis's paper-testing filters."
+            "Jarvis's loose paper-test filters."
         )
 
     lines = [
         "🚨 JARVIS SOLANA HUNT",
         "",
-        "🧪 PAPER TEST MODE",
+        "🧪 LOOSE PAPER TEST MODE",
         "",
     ]
 
@@ -870,7 +856,7 @@ def build_hunt_message(results):
 
 
 # =========================================================
-# FIND PAPER ENTRY
+# PAPER ENTRY
 # =========================================================
 
 async def try_paper_entry(
@@ -955,7 +941,7 @@ async def auto_hunt(
 
 
 # =========================================================
-# TELEGRAM /START
+# /START
 # =========================================================
 
 async def start(
@@ -1001,9 +987,8 @@ async def start(
         )
 
     await update.message.reply_text(
-        "✅ Paper scalping activated.\n"
-        "Paper entry threshold: "
-        f"{PAPER_MIN_ENTRY_SCORE}/100\n"
+        "✅ Loose paper-test mode activated.\n"
+        f"Entry threshold: {PAPER_MIN_ENTRY_SCORE}/100\n"
         "No real money will be used."
     )
 
@@ -1037,7 +1022,6 @@ async def paper(
 
         except Exception:
             account_value += position["cost"]
-
 
     await update.message.reply_text(
         "💵 PAPER ACCOUNT\n\n"
@@ -1135,12 +1119,10 @@ async def history(
         )
         return
 
-
     lines = [
         "📚 PAPER TRADE HISTORY",
         "",
     ]
-
 
     for trade in paper_trade_history[-10:]:
         lines.extend(
@@ -1154,14 +1136,13 @@ async def history(
             ]
         )
 
-
     await update.message.reply_text(
         "\n".join(lines)
     )
 
 
 # =========================================================
-# MANUAL /HUNT
+# /HUNT
 # =========================================================
 
 async def hunt(
@@ -1179,7 +1160,6 @@ async def hunt(
             build_hunt_message(results)
         )
 
-        # Manual /hunt can also trigger a PAPER entry.
         await try_paper_entry(
             context,
             results,
@@ -1230,10 +1210,7 @@ async def price(
             change_text = "N/A"
 
         else:
-            change_text = (
-                f"{change:+.2f}%"
-            )
-
+            change_text = f"{change:+.2f}%"
 
         await update.message.reply_text(
             f"🪙 {data['name']} "
@@ -1283,7 +1260,6 @@ async def analyse(
             )
             return
 
-
         prompt = f"""
 You are Crypto Jarvis, a cautious cryptocurrency analyst.
 
@@ -1302,16 +1278,13 @@ Give a concise analysis covering:
 5. Invalidation
 
 Do not guarantee profits.
-Do not claim that the coin will multiply in value.
 Use only the supplied market data.
 """
-
 
         response = client.responses.create(
             model="gpt-5-mini",
             input=prompt,
         )
-
 
         await update.message.reply_text(
             "🧠 JARVIS ANALYSIS\n\n"
@@ -1340,57 +1313,16 @@ def main():
         .build()
     )
 
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "hunt",
-            hunt,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "paper",
-            paper,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "positions",
-            positions,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "history",
-            history,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "price",
-            price,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "analyse",
-            analyse,
-        )
-    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("hunt", hunt))
+    app.add_handler(CommandHandler("paper", paper))
+    app.add_handler(CommandHandler("positions", positions))
+    app.add_handler(CommandHandler("history", history))
+    app.add_handler(CommandHandler("price", price))
+    app.add_handler(CommandHandler("analyse", analyse))
 
     print(
-        "Crypto Jarvis PAPER scalper online"
+        "Crypto Jarvis loose PAPER scalper online"
     )
 
     app.run_polling()
