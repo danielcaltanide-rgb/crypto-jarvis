@@ -2,180 +2,189 @@ import os
 import time
 import asyncio
 import requests
+from collections import deque
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from openai import OpenAI
-
-
-# =========================================================
-# ENVIRONMENT
-# =========================================================
-
-TELEGRAM_TOKEN = (
-    os.getenv("TELEGRAM_TOKEN")
-    or os.getenv("TELEGRAM_BOT_TOKEN")
-)
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-# Optional:
-# If you later create a free CoinGecko Demo API key,
-# add it in Railway as COINGECKO_API_KEY.
-COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
-
-if not TELEGRAM_TOKEN:
-    raise RuntimeError(
-        "Set TELEGRAM_TOKEN or TELEGRAM_BOT_TOKEN in Railway."
-    )
-
-if not OPENAI_API_KEY:
-    raise RuntimeError(
-        "Set OPENAI_API_KEY in Railway."
-    )
-
-client = OpenAI(
-    api_key=OPENAI_API_KEY
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
 )
 
 
-# =========================================================
-# GENERAL SETTINGS
-# =========================================================
+# ============================================================
+# CONFIG
+# ============================================================
 
-REQUEST_TIMEOUT = 15
+BOT_TOKEN = (
+    os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("TELEGRAM_TOKEN")
+)
 
-AUTO_SCAN_INTERVAL = 300
-FIRST_MEME_SCAN = 60
-FIRST_PERP_SCAN = 90
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-POSITION_MONITOR_INTERVAL = 30
-SEND_SCAN_SUMMARIES = True
-
-
-# =========================================================
-# SOLANA MEME PAPER SETTINGS
-# =========================================================
-
-MEME_STARTING_BALANCE = 1000.00
-MEME_TRADE_SIZE = 50.00
-
-MEME_ENTRY_SCORE = 45
-
-MEME_TAKE_PROFIT = 5.0
-MEME_STOP_LOSS = 2.0
-
-MEME_MAX_HOLD_MINUTES = 60
-MEME_MAX_OPEN_POSITIONS = 1
-
-MIN_MARKET_CAP = 100_000
-MAX_MARKET_CAP = 50_000_000
-
-MIN_LIQUIDITY = 25_000
-
-MIN_VOLUME_24H = 100_000
-MIN_VOLUME_1H = 2_500
-
-MIN_SCAN_SCORE = 35
-MAX_TOKEN_AGE_DAYS = 30
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "Missing TELEGRAM_BOT_TOKEN in Railway variables."
+    )
 
 
-# =========================================================
-# BTC / ETH / SOL / ICP PAPER SETTINGS
-# =========================================================
+# ============================================================
+# PAPER ACCOUNT
+# ============================================================
 
-PERP_STARTING_BALANCE = 1000.00
-PERP_COLLATERAL = 50.00
+STARTING_BALANCE = 1000.00
 
-PERP_LEVERAGE = 1.0
-PERP_ENTRY_SCORE = 60
+# Amount allocated to each simulated trade
+TRADE_SIZE = 20.00
 
-PERP_TAKE_PROFIT = 2.0
-PERP_STOP_LOSS = 1.0
+# Allows multiple trades at once
+MAX_OPEN_POSITIONS = 5
 
-PERP_MAX_HOLD_MINUTES = 120
-PERP_MAX_OPEN_POSITIONS = 1
+# Minimum score required for automatic paper entry
+ENTRY_SCORE = 62
 
-PERP_FEE_RATE = 0.0005
-PERP_SLIPPAGE_RATE = 0.0005
-
-PERP_ASSETS = {
-    "BTC": "bitcoin",
-    "ETH": "ethereum",
-    "SOL": "solana",
-    "ICP": "internet-computer",
-}
+# Minimum score shown as a watch alert
+WATCH_SCORE = 55
 
 
-# =========================================================
-# ICP ALERT SETTINGS
-# =========================================================
+# ============================================================
+# SCAN SPEED
+# ============================================================
 
-ICP_ALERT_1H_PERCENT = 1.5
-ICP_ALERT_24H_PERCENT = 5.0
-ICP_ALERT_COOLDOWN = 1800
+# New-token discovery
+SCAN_INTERVAL = 20
 
+# Open-position monitoring
+MONITOR_INTERVAL = 8
 
-# =========================================================
-# COINGECKO RATE-LIMIT SETTINGS
-# =========================================================
-
-# Keep one shared market snapshot for 2 minutes.
-COINGECKO_CACHE_TTL = 120
-
-# Never intentionally request fresh CoinGecko data
-# more than once every 30 seconds.
-COINGECKO_MIN_FETCH_GAP = 30
-
-# Backoff starts at 60 seconds on HTTP 429.
-COINGECKO_BACKOFF_BASE = 60
-COINGECKO_BACKOFF_MAX = 900
+# First automatic scan after startup
+FIRST_SCAN_DELAY = 10
 
 
-# =========================================================
-# PAPER STATE
-# =========================================================
+# ============================================================
+# NEW COIN FILTERS
+# ============================================================
 
-meme_balance = MEME_STARTING_BALANCE
-meme_positions = {}
-meme_history = []
+# Avoid buying instantly after creation because initial data
+# can be extremely noisy.
+MIN_AGE_MINUTES = 2
 
-perp_balance = PERP_STARTING_BALANCE
-perp_positions = {}
-perp_history = []
+# We want genuinely fresh pairs
+MAX_AGE_MINUTES = 180
 
-last_icp_alert_time = 0
-last_icp_alert_direction = None
+# Small-cap range
+MIN_MARKET_CAP = 25_000
+MAX_MARKET_CAP = 2_500_000
+
+# Liquidity filters
+MIN_LIQUIDITY = 12_000
+MAX_LIQUIDITY = 800_000
+
+# Activity requirements
+MIN_5M_VOLUME = 1_500
+MIN_5M_TRANSACTIONS = 8
+
+# Reject huge already-extended candles
+MAX_5M_PUMP = 30.0
+MAX_1H_PUMP = 150.0
 
 
-# =========================================================
-# SHARED MARKET CACHE
-# =========================================================
+# ============================================================
+# EXIT SETTINGS
+# ============================================================
 
-market_cache = {}
-market_cache_updated_at = 0.0
+# Net estimated paper profit/loss thresholds
+TAKE_PROFIT = 5.0
+STOP_LOSS = 3.0
 
-last_coingecko_fetch_attempt = 0.0
-coingecko_backoff_until = 0.0
-coingecko_backoff_seconds = 0
+# Once trade has reached +3%, protect the winner
+TRAIL_ACTIVATION = 3.0
+
+# Exit after dropping this much from peak
+TRAIL_DISTANCE = 2.0
+
+# Fast sniper — don't marry the meme coin
+MAX_HOLD_MINUTES = 15
 
 
-# =========================================================
-# HTTP HELPERS
-# =========================================================
+# ============================================================
+# PAPER EXECUTION COSTS
+# ============================================================
 
-def http_get_json(
-    url,
-    params=None,
-    headers=None,
-):
+# New coins can have ugly execution.
+# These deliberately penalize paper performance.
 
-    response = requests.get(
+ENTRY_SLIPPAGE = 0.008
+EXIT_SLIPPAGE = 0.008
+
+ENTRY_FEE_RATE = 0.003
+EXIT_FEE_RATE = 0.003
+
+
+# ============================================================
+# REENTRY / ALERT PROTECTION
+# ============================================================
+
+# Same token cannot be bought again for 30 minutes
+REENTRY_COOLDOWN = 30 * 60
+
+# Don't spam the same watch alert
+WATCH_COOLDOWN = 5 * 60
+
+
+# ============================================================
+# HTTP
+# ============================================================
+
+HTTP_TIMEOUT = 12
+
+SESSION = requests.Session()
+
+SESSION.headers.update(
+    {
+        "User-Agent":
+            "CaltanidePaperSniper/1.0"
+    }
+)
+
+
+# ============================================================
+# STATE
+# ============================================================
+
+paper_cash = STARTING_BALANCE
+
+positions = {}
+history = []
+
+recent_entries = {}
+recent_watch_alerts = {}
+
+last_scan_time = 0
+last_scan_candidates = 0
+last_scan_best = None
+
+# Remember recently discovered addresses so the scanner
+# has a larger candidate pool than only the current response.
+known_addresses = {}
+
+MAX_KNOWN_ADDRESSES = 600
+ADDRESS_MEMORY_SECONDS = 6 * 60 * 60
+
+# Keep recent scanner activity for /stats
+scan_log = deque(maxlen=200)
+
+
+# ============================================================
+# API HELPERS
+# ============================================================
+
+def get_json(url):
+
+    response = SESSION.get(
         url,
-        params=params,
-        headers=headers,
-        timeout=REQUEST_TIMEOUT,
+        timeout=HTTP_TIMEOUT,
     )
 
     response.raise_for_status()
@@ -183,315 +192,129 @@ def http_get_json(
     return response.json()
 
 
-# =========================================================
-# COINGECKO HELPERS
-# =========================================================
+def chunks(items, size):
 
-def coingecko_headers():
+    for index in range(
+        0,
+        len(items),
+        size,
+    ):
 
-    if COINGECKO_API_KEY:
-
-        return {
-            "x-cg-demo-api-key":
-            COINGECKO_API_KEY
-        }
-
-    return {}
+        yield items[
+            index:index + size
+        ]
 
 
-def _fetch_major_markets_from_coingecko():
+# ============================================================
+# DEX SCREENER DISCOVERY
+# ============================================================
 
-    global last_coingecko_fetch_attempt
-    global coingecko_backoff_until
-    global coingecko_backoff_seconds
+DISCOVERY_URLS = [
+
+    (
+        "https://api.dexscreener.com/"
+        "token-profiles/latest/v1"
+    ),
+
+    (
+        "https://api.dexscreener.com/"
+        "token-boosts/latest/v1"
+    ),
+
+    (
+        "https://api.dexscreener.com/"
+        "token-boosts/top/v1"
+    ),
+
+    (
+        "https://api.dexscreener.com/"
+        "community-takeovers/latest/v1"
+    ),
+]
+
+
+def cleanup_known_addresses():
 
     now = time.time()
 
-    if now < coingecko_backoff_until:
+    expired = [
 
-        remaining = int(
-            coingecko_backoff_until
-            - now
+        address
+
+        for address, timestamp
+        in known_addresses.items()
+
+        if (
+            now - timestamp
+            > ADDRESS_MEMORY_SECONDS
         )
-
-        raise RuntimeError(
-            f"CoinGecko cooling down for {remaining}s"
-        )
-
-    if (
-        now
-        - last_coingecko_fetch_attempt
-        < COINGECKO_MIN_FETCH_GAP
-    ):
-
-        raise RuntimeError(
-            "CoinGecko fetch gap active"
-        )
-
-    last_coingecko_fetch_attempt = now
-
-    try:
-
-        data = http_get_json(
-            "https://api.coingecko.com/api/v3/coins/markets",
-            params={
-                "vs_currency": "usd",
-                "ids": ",".join(
-                    PERP_ASSETS.values()
-                ),
-                "price_change_percentage":
-                "1h,24h",
-            },
-            headers=coingecko_headers(),
-        )
-
-    except requests.HTTPError as error:
-
-        status = (
-            error.response.status_code
-            if error.response is not None
-            else None
-        )
-
-        if status == 429:
-
-            if (
-                coingecko_backoff_seconds
-                == 0
-            ):
-
-                coingecko_backoff_seconds = (
-                    COINGECKO_BACKOFF_BASE
-                )
-
-            else:
-
-                coingecko_backoff_seconds = min(
-                    COINGECKO_BACKOFF_MAX,
-                    coingecko_backoff_seconds
-                    * 2,
-                )
-
-            coingecko_backoff_until = (
-                time.time()
-                + coingecko_backoff_seconds
-            )
-
-        raise
-
-    else:
-
-        coingecko_backoff_seconds = 0
-        coingecko_backoff_until = 0.0
-
-    id_to_symbol = {
-        coin_id: symbol
-        for symbol, coin_id
-        in PERP_ASSETS.items()
-    }
-
-    markets = {}
-
-    for item in data:
-
-        symbol = id_to_symbol.get(
-            item.get("id")
-        )
-
-        if not symbol:
-            continue
-
-        markets[symbol] = {
-            "id": item.get("id"),
-            "name": (
-                item.get("name")
-                or symbol
-            ),
-            "symbol": symbol,
-            "price": float(
-                item.get("current_price")
-                or 0
-            ),
-            "market_cap": float(
-                item.get("market_cap")
-                or 0
-            ),
-            "volume_24h": float(
-                item.get("total_volume")
-                or 0
-            ),
-            "change_1h": float(
-                item.get(
-                    "price_change_percentage_1h_in_currency"
-                )
-                or 0
-            ),
-            "change_24h": float(
-                item.get(
-                    "price_change_percentage_24h_in_currency"
-                )
-                or item.get(
-                    "price_change_percentage_24h"
-                )
-                or 0
-            ),
-        }
-
-    return markets
-
-
-def get_major_markets(
-    force=False,
-):
-
-    global market_cache
-    global market_cache_updated_at
-
-    now = time.time()
-
-    if (
-        market_cache
-        and not force
-        and (
-            now
-            - market_cache_updated_at
-            < COINGECKO_CACHE_TTL
-        )
-    ):
-
-        return market_cache
-
-    try:
-
-        fresh = (
-            _fetch_major_markets_from_coingecko()
-        )
-
-        if fresh:
-
-            market_cache = fresh
-            market_cache_updated_at = (
-                time.time()
-            )
-
-            return market_cache
-
-    except Exception as error:
-
-        print(
-            "CoinGecko refresh error:",
-            repr(error),
-        )
-
-        # Important:
-        # If CoinGecko rate-limits us,
-        # keep using the last successful snapshot.
-        if market_cache:
-            return market_cache
-
-        raise
-
-    return market_cache
-
-
-def get_major_market(
-    symbol,
-):
-
-    return get_major_markets().get(
-        symbol.upper()
-    )
-
-
-def get_major_price(
-    symbol,
-):
-
-    market = get_major_market(
-        symbol
-    )
-
-    if not market:
-        return None
-
-    return market["price"]
-
-
-def coin_alias_to_symbol(
-    value,
-):
-
-    aliases = {
-        "btc": "BTC",
-        "bitcoin": "BTC",
-        "eth": "ETH",
-        "ethereum": "ETH",
-        "sol": "SOL",
-        "solana": "SOL",
-        "icp": "ICP",
-        "internet-computer": "ICP",
-    }
-
-    return aliases.get(
-        value.lower()
-    )
-
-
-# =========================================================
-# DEXSCREENER SOLANA DISCOVERY
-# =========================================================
-
-def collect_solana_addresses():
-
-    endpoints = [
-        (
-            "https://api.dexscreener.com/"
-            "token-profiles/latest/v1"
-        ),
-        (
-            "https://api.dexscreener.com/"
-            "token-boosts/latest/v1"
-        ),
-        (
-            "https://api.dexscreener.com/"
-            "token-boosts/top/v1"
-        ),
     ]
 
-    seen = set()
-    addresses = []
+    for address in expired:
 
-    for url in endpoints:
+        known_addresses.pop(
+            address,
+            None,
+        )
+
+    # Hard memory limit
+    if (
+        len(known_addresses)
+        > MAX_KNOWN_ADDRESSES
+    ):
+
+        ordered = sorted(
+            known_addresses.items(),
+            key=lambda item:
+                item[1],
+            reverse=True,
+        )
+
+        keep = dict(
+            ordered[
+                :MAX_KNOWN_ADDRESSES
+            ]
+        )
+
+        known_addresses.clear()
+        known_addresses.update(
+            keep
+        )
+
+
+def discover_solana_tokens():
+
+    now = time.time()
+
+    for url in DISCOVERY_URLS:
 
         try:
 
-            items = http_get_json(
+            data = get_json(
                 url
             )
 
         except Exception as error:
 
             print(
-                "Dex discovery error:",
+                "Discovery error:",
                 repr(error),
             )
 
             continue
 
         if not isinstance(
-            items,
+            data,
             list,
         ):
-
             continue
 
-        for item in items:
+        for item in data:
 
             if (
                 item.get("chainId")
                 != "solana"
             ):
-
                 continue
 
             address = item.get(
@@ -501,48 +324,34 @@ def collect_solana_addresses():
             if not address:
                 continue
 
-            if address in seen:
-                continue
-
-            seen.add(
+            known_addresses[
                 address
-            )
+            ] = now
 
-            addresses.append(
-                address
-            )
+    cleanup_known_addresses()
 
-    return addresses
-
-
-def chunked(
-    items,
-    size,
-):
-
-    for i in range(
-        0,
-        len(items),
-        size,
-    ):
-
-        yield items[
-            i:i + size
-        ]
+    return list(
+        known_addresses.keys()
+    )
 
 
-def get_solana_candidates():
+# ============================================================
+# FETCH PAIRS
+# ============================================================
+
+def fetch_candidate_pairs():
 
     addresses = (
-        collect_solana_addresses()
+        discover_solana_tokens()
     )
 
     if not addresses:
-        return []
+        return {}
 
     all_pairs = []
 
-    for batch in chunked(
+    # DEX Screener token lookup supports batches.
+    for batch in chunks(
         addresses,
         30,
     ):
@@ -555,28 +364,29 @@ def get_solana_candidates():
 
         try:
 
-            pairs = http_get_json(
+            data = get_json(
                 url
             )
 
         except Exception as error:
 
             print(
-                "Dex pair lookup error:",
+                "Token batch error:",
                 repr(error),
             )
 
             continue
 
         if isinstance(
-            pairs,
+            data,
             list,
         ):
 
             all_pairs.extend(
-                pairs
+                data
             )
 
+    # Keep highest-liquidity Solana pair for each token.
     best_pairs = {}
 
     for pair in all_pairs:
@@ -585,7 +395,6 @@ def get_solana_candidates():
             pair.get("chainId")
             != "solana"
         ):
-
             continue
 
         base = (
@@ -610,19 +419,22 @@ def get_solana_candidates():
             or 0
         )
 
-        old_pair = (
-            best_pairs.get(
-                address
-            )
+        old = best_pairs.get(
+            address
         )
+
+        if old is None:
+
+            best_pairs[
+                address
+            ] = pair
+
+            continue
 
         old_liquidity = float(
             (
                 (
-                    (
-                        old_pair
-                        or {}
-                    ).get("liquidity")
+                    old.get("liquidity")
                     or {}
                 ).get("usd")
             )
@@ -630,8 +442,7 @@ def get_solana_candidates():
         )
 
         if (
-            old_pair is None
-            or liquidity
+            liquidity
             > old_liquidity
         ):
 
@@ -639,159 +450,770 @@ def get_solana_candidates():
                 address
             ] = pair
 
-    now_ms = int(
-        time.time() * 1000
+    return best_pairs
+
+
+# ============================================================
+# NORMALIZE TOKEN DATA
+# ============================================================
+
+def normalize_pair(
+    address,
+    pair,
+):
+
+    base = (
+        pair.get("baseToken")
+        or {}
     )
 
-    candidates = []
+    volume = (
+        pair.get("volume")
+        or {}
+    )
+
+    changes = (
+        pair.get("priceChange")
+        or {}
+    )
+
+    transactions = (
+        pair.get("txns")
+        or {}
+    )
+
+    tx5 = (
+        transactions.get("m5")
+        or {}
+    )
+
+    tx1 = (
+        transactions.get("h1")
+        or {}
+    )
+
+    created = pair.get(
+        "pairCreatedAt"
+    )
+
+    if not created:
+        return None
+
+    try:
+
+        age_minutes = (
+
+            int(time.time() * 1000)
+            - int(created)
+
+        ) / 60000
+
+    except Exception:
+
+        return None
+
+    if age_minutes < 0:
+        return None
+
+    try:
+
+        price = float(
+            pair.get("priceUsd")
+            or 0
+        )
+
+    except Exception:
+
+        price = 0
+
+    market_cap = float(
+        pair.get("marketCap")
+        or pair.get("fdv")
+        or 0
+    )
+
+    liquidity = float(
+        (
+            (
+                pair.get("liquidity")
+                or {}
+            ).get("usd")
+        )
+        or 0
+    )
+
+    return {
+
+        "address":
+            address,
+
+        "pair":
+            pair.get("pairAddress")
+            or "",
+
+        "dex":
+            pair.get("dexId")
+            or "unknown",
+
+        "name":
+            base.get("name")
+            or "Unknown",
+
+        "symbol":
+            base.get("symbol")
+            or "?",
+
+        "price":
+            price,
+
+        "age":
+            age_minutes,
+
+        "market_cap":
+            market_cap,
+
+        "liquidity":
+            liquidity,
+
+        "volume_5m":
+            float(
+                volume.get("m5")
+                or 0
+            ),
+
+        "volume_1h":
+            float(
+                volume.get("h1")
+                or 0
+            ),
+
+        "volume_24h":
+            float(
+                volume.get("h24")
+                or 0
+            ),
+
+        "buys_5m":
+            int(
+                tx5.get("buys")
+                or 0
+            ),
+
+        "sells_5m":
+            int(
+                tx5.get("sells")
+                or 0
+            ),
+
+        "buys_1h":
+            int(
+                tx1.get("buys")
+                or 0
+            ),
+
+        "sells_1h":
+            int(
+                tx1.get("sells")
+                or 0
+            ),
+
+        "change_5m":
+            float(
+                changes.get("m5")
+                or 0
+            ),
+
+        "change_1h":
+            float(
+                changes.get("h1")
+                or 0
+            ),
+    }
+
+
+# ============================================================
+# SNIPER SCORE
+# ============================================================
+
+def score_token(c):
+
+    reasons = []
+    risks = []
+
+    # --------------------------------------------------------
+    # HARD REJECTION
+    # --------------------------------------------------------
+
+    if c["price"] <= 0:
+
+        return (
+            0,
+            reasons,
+            ["invalid price"],
+        )
+
+    if (
+        c["age"]
+        < MIN_AGE_MINUTES
+        or c["age"]
+        > MAX_AGE_MINUTES
+    ):
+
+        return (
+            0,
+            reasons,
+            ["age rejected"],
+        )
+
+    if not (
+        MIN_MARKET_CAP
+        <= c["market_cap"]
+        <= MAX_MARKET_CAP
+    ):
+
+        return (
+            0,
+            reasons,
+            ["market cap rejected"],
+        )
+
+    if not (
+        MIN_LIQUIDITY
+        <= c["liquidity"]
+        <= MAX_LIQUIDITY
+    ):
+
+        return (
+            0,
+            reasons,
+            ["liquidity rejected"],
+        )
+
+    if (
+        c["volume_5m"]
+        < MIN_5M_VOLUME
+    ):
+
+        return (
+            0,
+            reasons,
+            ["volume rejected"],
+        )
+
+    tx_count = (
+        c["buys_5m"]
+        + c["sells_5m"]
+    )
+
+    if (
+        tx_count
+        < MIN_5M_TRANSACTIONS
+    ):
+
+        return (
+            0,
+            reasons,
+            ["too few transactions"],
+        )
+
+    if (
+        c["change_5m"]
+        > MAX_5M_PUMP
+    ):
+
+        return (
+            0,
+            reasons,
+            ["5m pump too extended"],
+        )
+
+    if (
+        c["change_1h"]
+        > MAX_1H_PUMP
+    ):
+
+        return (
+            0,
+            reasons,
+            ["1h pump too extended"],
+        )
+
+
+    # --------------------------------------------------------
+    # SCORE
+    # --------------------------------------------------------
+
+    score = 0
+
+
+    # AGE — sniper wants fresh activity
+
+    if c["age"] <= 10:
+
+        score += 15
+
+        reasons.append(
+            "very fresh"
+        )
+
+    elif c["age"] <= 30:
+
+        score += 13
+
+        reasons.append(
+            "fresh launch"
+        )
+
+    elif c["age"] <= 60:
+
+        score += 9
+
+    else:
+
+        score += 4
+
+
+    # MARKET CAP
+
+    if (
+        50_000
+        <= c["market_cap"]
+        <= 500_000
+    ):
+
+        score += 14
+
+        reasons.append(
+            "micro-cap"
+        )
+
+    elif (
+        c["market_cap"]
+        <= 1_000_000
+    ):
+
+        score += 10
+
+    else:
+
+        score += 5
+
+
+    # LIQUIDITY
+
+    if (
+        30_000
+        <= c["liquidity"]
+        <= 250_000
+    ):
+
+        score += 17
+
+        reasons.append(
+            "good sniper liquidity"
+        )
+
+    elif (
+        c["liquidity"]
+        >= 20_000
+    ):
+
+        score += 11
+
+    else:
+
+        score += 5
+
+
+    # VOLUME
+
+    if (
+        c["volume_5m"]
+        >= 50_000
+    ):
+
+        score += 16
+
+        reasons.append(
+            "explosive volume"
+        )
+
+    elif (
+        c["volume_5m"]
+        >= 20_000
+    ):
+
+        score += 13
+
+        reasons.append(
+            "strong volume"
+        )
+
+    elif (
+        c["volume_5m"]
+        >= 5_000
+    ):
+
+        score += 8
+
+    else:
+
+        score += 4
+
+
+    # --------------------------------------------------------
+    # VOLUME ACCELERATION
+    # --------------------------------------------------------
+
+    if (
+        c["volume_1h"]
+        > 0
+    ):
+
+        expected_5m = (
+            c["volume_1h"]
+            / 12
+        )
+
+        if expected_5m > 0:
+
+            acceleration = (
+                c["volume_5m"]
+                / expected_5m
+            )
+
+            if acceleration >= 4:
+
+                score += 14
+
+                reasons.append(
+                    "volume exploding"
+                )
+
+            elif acceleration >= 2:
+
+                score += 10
+
+                reasons.append(
+                    "volume accelerating"
+                )
+
+            elif acceleration >= 1.25:
+
+                score += 5
+
+            elif acceleration < 0.5:
+
+                score -= 6
+
+                risks.append(
+                    "volume fading"
+                )
+
+
+    # --------------------------------------------------------
+    # BUY / SELL PRESSURE
+    # --------------------------------------------------------
+
+    buys = c[
+        "buys_5m"
+    ]
+
+    sells = c[
+        "sells_5m"
+    ]
+
+    if (
+        sells == 0
+        and buys >= 10
+    ):
+
+        score += 15
+
+        reasons.append(
+            "buyers dominating"
+        )
+
+    elif sells > 0:
+
+        ratio = (
+            buys / sells
+        )
+
+        if ratio >= 3:
+
+            score += 16
+
+            reasons.append(
+                "extreme buy pressure"
+            )
+
+        elif ratio >= 2:
+
+            score += 13
+
+            reasons.append(
+                "strong buy pressure"
+            )
+
+        elif ratio >= 1.4:
+
+            score += 8
+
+        elif ratio < 0.8:
+
+            score -= 12
+
+            risks.append(
+                "sell pressure"
+            )
+
+
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
+
+    move = c[
+        "change_5m"
+    ]
+
+    if (
+        1
+        <= move
+        <= 8
+    ):
+
+        score += 12
+
+        reasons.append(
+            "clean momentum"
+        )
+
+    elif (
+        8
+        < move
+        <= 15
+    ):
+
+        score += 8
+
+    elif (
+        15
+        < move
+        <= 25
+    ):
+
+        score += 2
+
+        risks.append(
+            "already moving fast"
+        )
+
+    elif move < -10:
+
+        score -= 15
+
+        risks.append(
+            "price falling"
+        )
+
+    elif move < 0:
+
+        score -= 5
+
+
+    # --------------------------------------------------------
+    # LIQUIDITY / MARKET CAP
+    # --------------------------------------------------------
+
+    if (
+        c["market_cap"]
+        > 0
+    ):
+
+        liquidity_ratio = (
+            c["liquidity"]
+            / c["market_cap"]
+        )
+
+        if (
+            liquidity_ratio
+            >= 0.25
+        ):
+
+            score += 9
+
+            reasons.append(
+                "strong liquidity ratio"
+            )
+
+        elif (
+            liquidity_ratio
+            >= 0.10
+        ):
+
+            score += 5
+
+        elif (
+            liquidity_ratio
+            < 0.03
+        ):
+
+            score -= 15
+
+            risks.append(
+                "thin liquidity"
+            )
+
+
+    return (
+        max(
+            0,
+            min(
+                score,
+                100,
+            ),
+        ),
+        reasons,
+        risks,
+    )
+
+
+# ============================================================
+# GET RANKINGS
+# ============================================================
+
+def get_rankings():
+
+    pairs = (
+        fetch_candidate_pairs()
+    )
+
+    results = []
+
+    now = time.time()
 
     for (
         address,
         pair,
-    ) in best_pairs.items():
+    ) in pairs.items():
 
-        base = (
-            pair.get("baseToken")
-            or {}
-        )
-
-        volume = (
-            pair.get("volume")
-            or {}
-        )
-
-        tx_1h = (
-            (
-                pair.get("txns")
-                or {}
-            ).get("h1")
-            or {}
-        )
-
-        changes = (
-            pair.get("priceChange")
-            or {}
-        )
-
-        created = pair.get(
-            "pairCreatedAt"
-        )
-
-        age_hours = None
-
-        if created:
-
-            try:
-
-                age_hours = max(
-                    0,
-                    now_ms
-                    - int(created),
-                ) / 3_600_000
-
-            except Exception:
-
-                age_hours = None
-
-        try:
-
-            price = float(
-                pair.get("priceUsd")
-                or 0
+        candidate = (
+            normalize_pair(
+                address,
+                pair,
             )
-
-        except Exception:
-
-            price = 0
-
-        candidates.append(
-            {
-                "address": address,
-                "name": (
-                    base.get("name")
-                    or "Unknown"
-                ),
-                "symbol": (
-                    base.get("symbol")
-                    or "?"
-                ),
-                "price": price,
-                "market_cap": float(
-                    pair.get("marketCap")
-                    or pair.get("fdv")
-                    or 0
-                ),
-                "liquidity": float(
-                    (
-                        (
-                            pair.get(
-                                "liquidity"
-                            )
-                            or {}
-                        ).get("usd")
-                    )
-                    or 0
-                ),
-                "volume_24h": float(
-                    volume.get("h24")
-                    or 0
-                ),
-                "volume_1h": float(
-                    volume.get("h1")
-                    or 0
-                ),
-                "buys_1h": int(
-                    tx_1h.get("buys")
-                    or 0
-                ),
-                "sells_1h": int(
-                    tx_1h.get("sells")
-                    or 0
-                ),
-                "change_1h": float(
-                    changes.get("h1")
-                    or 0
-                ),
-                "change_24h": float(
-                    changes.get("h24")
-                    or 0
-                ),
-                "age_hours":
-                    age_hours,
-            }
         )
 
-    return candidates
+        if not candidate:
+            continue
+
+        # Don't show already-open token
+        if (
+            address
+            in positions
+        ):
+            continue
+
+        # Reentry cooldown
+        previous_entry = (
+            recent_entries.get(
+                address,
+                0,
+            )
+        )
+
+        if (
+            previous_entry
+            and (
+                now
+                - previous_entry
+            )
+            < REENTRY_COOLDOWN
+        ):
+
+            continue
+
+        (
+            score,
+            reasons,
+            risks,
+        ) = score_token(
+            candidate
+        )
+
+        if score < 40:
+            continue
+
+        candidate[
+            "score"
+        ] = score
+
+        candidate[
+            "reasons"
+        ] = reasons
+
+        candidate[
+            "risks"
+        ] = risks
+
+        results.append(
+            candidate
+        )
+
+    results.sort(
+
+        key=lambda coin: (
+
+            coin["score"],
+            coin["volume_5m"],
+            coin["buys_5m"],
+            coin["liquidity"],
+        ),
+
+        reverse=True,
+    )
+
+    return results
 
 
-def get_solana_token_price(
+# ============================================================
+# CURRENT PRICE
+# ============================================================
+
+def get_token_price(
     address,
 ):
 
-    pairs = http_get_json(
-        (
-            "https://api.dexscreener.com/"
-            "token-pairs/v1/solana/"
-            f"{address}"
-        )
+    url = (
+        "https://api.dexscreener.com/"
+        "token-pairs/v1/solana/"
+        f"{address}"
     )
 
-    if not isinstance(
-        pairs,
-        list,
+    data = get_json(
+        url
+    )
+
+    if (
+        not isinstance(
+            data,
+            list,
+        )
+        or not data
     ):
 
         return None
 
-    if not pairs:
-        return None
-
+    # Highest-liquidity pair
     pair = max(
-        pairs,
-        key=lambda p: float(
+
+        data,
+
+        key=lambda item: float(
             (
                 (
-                    p.get("liquidity")
+                    item.get("liquidity")
                     or {}
                 ).get("usd")
             )
@@ -811,384 +1233,226 @@ def get_solana_token_price(
         return None
 
 
-# =========================================================
-# MEME SCORING
-# =========================================================
+# ============================================================
+# PAPER P/L
+# ============================================================
 
-def score_meme(
-    candidate,
+def estimate_exit(
+    position,
+    quote,
 ):
 
-    score = 0
+    simulated_exit_price = (
 
-    mc = candidate[
-        "market_cap"
-    ]
+        quote
 
-    liquidity = candidate[
-        "liquidity"
-    ]
+        * (
+            1
+            - EXIT_SLIPPAGE
+        )
+    )
 
-    volume_24h = candidate[
-        "volume_24h"
-    ]
+    gross = (
 
-    volume_1h = candidate[
-        "volume_1h"
-    ]
+        position[
+            "quantity"
+        ]
 
-    buys = candidate[
-        "buys_1h"
-    ]
+        * simulated_exit_price
+    )
 
-    sells = candidate[
-        "sells_1h"
-    ]
+    exit_fee = (
+        gross
+        * EXIT_FEE_RATE
+    )
 
-    change_1h = candidate[
-        "change_1h"
-    ]
+    proceeds = (
+        gross
+        - exit_fee
+    )
 
-    change_24h = candidate[
-        "change_24h"
-    ]
+    total_entry_cost = (
 
-    age = candidate[
-        "age_hours"
-    ]
+        position[
+            "trade_size"
+        ]
 
-    if age is not None:
+        + position[
+            "entry_fee"
+        ]
+    )
 
-        if age < 1:
-            score -= 8
+    pnl = (
+        proceeds
+        - total_entry_cost
+    )
 
-        elif age <= 72:
-            score += 8
+    pnl_pct = (
 
-        elif age <= 14 * 24:
-            score += 4
+        pnl
+        / total_entry_cost
+        * 100
 
-    if (
-        500_000
-        <= mc
-        <= 10_000_000
-    ):
-
-        score += 20
-
-    elif (
-        100_000
-        <= mc
-        <= 50_000_000
-    ):
-
-        score += 10
-
-    if liquidity >= 1_000_000:
-        score += 20
-
-    elif liquidity >= 500_000:
-        score += 16
-
-    elif liquidity >= 250_000:
-        score += 12
-
-    elif liquidity >= 100_000:
-        score += 8
-
-    elif liquidity >= 25_000:
-        score += 4
-
-    if volume_24h >= 5_000_000:
-        score += 12
-
-    elif volume_24h >= 1_000_000:
-        score += 9
-
-    elif volume_24h >= 100_000:
-        score += 5
-
-    expected_hourly = (
-        volume_24h / 24
-        if volume_24h
+        if total_entry_cost
         else 0
     )
 
-    if expected_hourly:
+    return {
 
-        acceleration = (
-            volume_1h
-            / expected_hourly
-        )
+        "exit_price":
+            simulated_exit_price,
 
-        if acceleration >= 4:
-            score += 18
+        "exit_fee":
+            exit_fee,
 
-        elif acceleration >= 2:
-            score += 13
+        "proceeds":
+            proceeds,
 
-        elif acceleration >= 1.2:
-            score += 7
+        "pnl":
+            pnl,
 
-        elif acceleration < 0.35:
-            score -= 5
-
-    if (
-        buys + sells
-        >= 10
-    ):
-
-        if sells == 0:
-            score += 12
-
-        else:
-
-            ratio = buys / sells
-
-            if ratio >= 2:
-                score += 14
-
-            elif ratio >= 1.4:
-                score += 10
-
-            elif ratio >= 1.1:
-                score += 5
-
-            elif ratio < 0.7:
-                score -= 8
-
-    if (
-        1
-        <= change_1h
-        <= 15
-    ):
-
-        score += 10
-
-    elif (
-        15
-        < change_1h
-        <= 30
-    ):
-
-        score += 5
-
-    elif change_1h > 60:
-        score -= 20
-
-    elif change_1h > 35:
-        score -= 10
-
-    elif change_1h < -20:
-        score -= 15
-
-    elif change_1h < -10:
-        score -= 6
-
-    if change_24h > 300:
-        score -= 15
-
-    if mc and liquidity:
-
-        ratio = (
-            liquidity / mc
-        )
-
-        if ratio >= 0.20:
-            score += 8
-
-        elif ratio >= 0.08:
-            score += 4
-
-        elif ratio < 0.02:
-            score -= 12
-
-    score = max(
-        0,
-        min(
-            100,
-            score,
-        ),
-    )
-
-    if score >= 80:
-        label = "🔥 STRONG WATCH"
-
-    elif score >= 65:
-        label = "👀 WATCH"
-
-    elif score >= 35:
-        label = "⚠️ SPECULATIVE"
-
-    else:
-        label = "WEAK"
-
-    return (
-        score,
-        label,
-    )
+        "pnl_pct":
+            pnl_pct,
+    }
 
 
-def get_ranked_memes():
+# ============================================================
+# PAPER ENTRY
+# ============================================================
 
-    results = []
-
-    for candidate in (
-        get_solana_candidates()
-    ):
-
-        if (
-            candidate["price"]
-            <= 0
-        ):
-            continue
-
-        if not (
-            MIN_MARKET_CAP
-            <= candidate["market_cap"]
-            <= MAX_MARKET_CAP
-        ):
-            continue
-
-        if (
-            candidate["liquidity"]
-            < MIN_LIQUIDITY
-        ):
-            continue
-
-        if (
-            candidate["volume_24h"]
-            < MIN_VOLUME_24H
-        ):
-            continue
-
-        if (
-            candidate["volume_1h"]
-            < MIN_VOLUME_1H
-        ):
-            continue
-
-        if (
-            candidate["age_hours"]
-            is not None
-            and candidate["age_hours"]
-            > MAX_TOKEN_AGE_DAYS
-            * 24
-        ):
-            continue
-
-        (
-            score,
-            label,
-        ) = score_meme(
-            candidate
-        )
-
-        if (
-            score
-            < MIN_SCAN_SCORE
-        ):
-            continue
-
-        candidate[
-            "score"
-        ] = score
-
-        candidate[
-            "label"
-        ] = label
-
-        results.append(
-            candidate
-        )
-
-    results.sort(
-        key=lambda item: (
-            item["score"],
-            item["volume_1h"],
-            item["liquidity"],
-        ),
-        reverse=True,
-    )
-
-    return results
-
-
-# =========================================================
-# MEME PAPER TRADES
-# =========================================================
-
-def open_meme_trade(
-    candidate,
+def open_trade(
+    coin,
 ):
 
-    global meme_balance
+    global paper_cash
 
     if (
-        len(meme_positions)
-        >= MEME_MAX_OPEN_POSITIONS
+        len(positions)
+        >= MAX_OPEN_POSITIONS
     ):
+
         return None
 
-    if (
-        meme_balance
-        < MEME_TRADE_SIZE
-    ):
+    address = coin[
+        "address"
+    ]
+
+    if address in positions:
         return None
 
-    if (
-        candidate["address"]
-        in meme_positions
-    ):
+    entry_quote = coin[
+        "price"
+    ]
+
+    if entry_quote <= 0:
         return None
 
+    simulated_entry = (
+
+        entry_quote
+
+        * (
+            1
+            + ENTRY_SLIPPAGE
+        )
+    )
+
+    entry_fee = (
+        TRADE_SIZE
+        * ENTRY_FEE_RATE
+    )
+
+    total_required = (
+        TRADE_SIZE
+        + entry_fee
+    )
+
     if (
-        candidate["price"]
-        <= 0
+        paper_cash
+        < total_required
     ):
+
         return None
+
+    quantity = (
+        TRADE_SIZE
+        / simulated_entry
+    )
 
     position = {
+
         "address":
-            candidate["address"],
+            address,
+
         "name":
-            candidate["name"],
+            coin["name"],
+
         "symbol":
-            candidate["symbol"],
-        "entry_price":
-            candidate["price"],
-        "quantity":
-            MEME_TRADE_SIZE
-            / candidate["price"],
-        "cost":
-            MEME_TRADE_SIZE,
+            coin["symbol"],
+
         "score":
-            candidate["score"],
+            coin["score"],
+
+        "market_cap":
+            coin["market_cap"],
+
+        "liquidity":
+            coin["liquidity"],
+
+        "entry_quote":
+            entry_quote,
+
+        "entry_price":
+            simulated_entry,
+
+        "trade_size":
+            TRADE_SIZE,
+
+        "entry_fee":
+            entry_fee,
+
+        "quantity":
+            quantity,
+
+        "highest_quote":
+            entry_quote,
+
+        "trailing":
+            False,
+
         "opened_at":
             time.time(),
     }
 
-    meme_positions[
-        candidate["address"]
+    paper_cash -= (
+        total_required
+    )
+
+    positions[
+        address
     ] = position
 
-    meme_balance -= (
-        MEME_TRADE_SIZE
-    )
+    recent_entries[
+        address
+    ] = time.time()
 
     return position
 
 
-def close_meme_trade(
+# ============================================================
+# PAPER EXIT
+# ============================================================
+
+def close_trade(
     address,
-    current_price,
+    quote,
     reason,
 ):
 
-    global meme_balance
+    global paper_cash
 
     position = (
-        meme_positions.get(
+        positions.get(
             address
         )
     )
@@ -1196,455 +1460,56 @@ def close_meme_trade(
     if not position:
         return None
 
-    proceeds = (
-        position["quantity"]
-        * current_price
+    result = (
+        estimate_exit(
+            position,
+            quote,
+        )
     )
 
-    pnl = (
-        proceeds
-        - position["cost"]
+    paper_cash += (
+        result["proceeds"]
     )
 
     trade = {
+
         **position,
-        "exit_price":
-            current_price,
-        "pnl":
-            pnl,
-        "pnl_pct":
-            pnl
-            / position["cost"]
-            * 100,
+
+        **result,
+
+        "exit_quote":
+            quote,
+
         "reason":
             reason,
+
         "closed_at":
             time.time(),
     }
 
-    meme_balance += (
-        proceeds
-    )
-
-    meme_history.append(
+    history.append(
         trade
     )
 
-    del meme_positions[
-        address
-    ]
+    positions.pop(
+        address,
+        None,
+    )
 
     return trade
 
 
-# =========================================================
-# MAJOR COIN SIGNAL ENGINE
-# =========================================================
-
-def score_major_market(
-    market,
-):
-
-    long_score = 0
-    short_score = 0
-
-    change_1h = market[
-        "change_1h"
-    ]
-
-    change_24h = market[
-        "change_24h"
-    ]
-
-    activity_ratio = (
-        market["volume_24h"]
-        / market["market_cap"]
-        if market["market_cap"]
-        else 0
-    )
-
-    if (
-        activity_ratio
-        >= 0.03
-    ):
-        long_score += 10
-        short_score += 10
-
-    if (
-        0.4
-        <= change_1h
-        <= 4
-    ):
-        long_score += 35
-
-    elif change_1h > 4:
-        long_score += 15
-
-    if (
-        0.5
-        <= change_24h
-        <= 12
-    ):
-        long_score += 30
-
-    elif change_24h > 12:
-        long_score += 10
-
-    if (
-        change_1h > 0
-        and change_24h > 0
-    ):
-        long_score += 20
-
-    if (
-        -4
-        <= change_1h
-        <= -0.4
-    ):
-        short_score += 35
-
-    elif change_1h < -4:
-        short_score += 15
-
-    if (
-        -12
-        <= change_24h
-        <= -0.5
-    ):
-        short_score += 30
-
-    elif change_24h < -12:
-        short_score += 10
-
-    if (
-        change_1h < 0
-        and change_24h < 0
-    ):
-        short_score += 20
-
-    if abs(change_1h) > 8:
-        long_score -= 20
-        short_score -= 20
-
-    if abs(change_24h) > 20:
-        long_score -= 15
-        short_score -= 15
-
-    long_score = max(
-        0,
-        min(100, long_score),
-    )
-
-    short_score = max(
-        0,
-        min(100, short_score),
-    )
-
-    if (
-        long_score
-        > short_score
-    ):
-        return (
-            "LONG",
-            long_score,
-        )
-
-    if (
-        short_score
-        > long_score
-    ):
-        return (
-            "SHORT",
-            short_score,
-        )
-
-    return (
-        "NONE",
-        0,
-    )
-
-
-def get_major_signals():
-
-    signals = []
-
-    markets = (
-        get_major_markets()
-    )
-
-    for (
-        symbol,
-        market,
-    ) in markets.items():
-
-        (
-            side,
-            score,
-        ) = score_major_market(
-            market
-        )
-
-        signals.append(
-            {
-                **market,
-                "side":
-                    side,
-                "score":
-                    score,
-            }
-        )
-
-    signals.sort(
-        key=lambda item:
-            item["score"],
-        reverse=True,
-    )
-
-    return signals
-
-
-# =========================================================
-# PAPER LONG / SHORT
-# =========================================================
-
-def open_perp_trade(
-    signal,
-):
-
-    global perp_balance
-
-    if (
-        len(perp_positions)
-        >= PERP_MAX_OPEN_POSITIONS
-    ):
-        return None
-
-    if (
-        signal["symbol"]
-        in perp_positions
-    ):
-        return None
-
-    if (
-        signal["side"]
-        not in (
-            "LONG",
-            "SHORT",
-        )
-    ):
-        return None
-
-    if (
-        signal["price"]
-        <= 0
-    ):
-        return None
-
-    notional = (
-        PERP_COLLATERAL
-        * PERP_LEVERAGE
-    )
-
-    entry_fee = (
-        notional
-        * PERP_FEE_RATE
-    )
-
-    if (
-        perp_balance
-        < PERP_COLLATERAL
-        + entry_fee
-    ):
-        return None
-
-    if (
-        signal["side"]
-        == "LONG"
-    ):
-
-        entry_price = (
-            signal["price"]
-            * (
-                1
-                + PERP_SLIPPAGE_RATE
-            )
-        )
-
-    else:
-
-        entry_price = (
-            signal["price"]
-            * (
-                1
-                - PERP_SLIPPAGE_RATE
-            )
-        )
-
-    perp_balance -= (
-        PERP_COLLATERAL
-        + entry_fee
-    )
-
-    position = {
-        "symbol":
-            signal["symbol"],
-        "name":
-            signal["name"],
-        "side":
-            signal["side"],
-        "score":
-            signal["score"],
-        "entry_price":
-            entry_price,
-        "collateral":
-            PERP_COLLATERAL,
-        "notional":
-            notional,
-        "entry_fee":
-            entry_fee,
-        "opened_at":
-            time.time(),
-    }
-
-    perp_positions[
-        signal["symbol"]
-    ] = position
-
-    return position
-
-
-def close_perp_trade(
-    symbol,
-    market_price,
-    reason,
-):
-
-    global perp_balance
-
-    position = (
-        perp_positions.get(
-            symbol
-        )
-    )
-
-    if not position:
-        return None
-
-    if (
-        position["side"]
-        == "LONG"
-    ):
-
-        exit_price = (
-            market_price
-            * (
-                1
-                - PERP_SLIPPAGE_RATE
-            )
-        )
-
-        return_pct = (
-            exit_price
-            - position["entry_price"]
-        ) / position["entry_price"]
-
-    else:
-
-        exit_price = (
-            market_price
-            * (
-                1
-                + PERP_SLIPPAGE_RATE
-            )
-        )
-
-        return_pct = (
-            position["entry_price"]
-            - exit_price
-        ) / position["entry_price"]
-
-    gross_pnl = (
-        return_pct
-        * position["notional"]
-    )
-
-    exit_fee = (
-        position["notional"]
-        * PERP_FEE_RATE
-    )
-
-    net_pnl = (
-        gross_pnl
-        - position["entry_fee"]
-        - exit_fee
-    )
-
-    perp_balance += (
-        position["collateral"]
-        + net_pnl
-    )
-
-    trade = {
-        **position,
-        "exit_price":
-            exit_price,
-        "net_pnl":
-            net_pnl,
-        "pnl_pct":
-            net_pnl
-            / position["collateral"]
-            * 100,
-        "reason":
-            reason,
-        "closed_at":
-            time.time(),
-    }
-
-    perp_history.append(
-        trade
-    )
-
-    del perp_positions[
-        symbol
-    ]
-
-    return trade
-
-
-# =========================================================
-# BACKGROUND MARKET REFRESH
-# =========================================================
-
-async def market_refresh_job(
+# ============================================================
+# AUTOMATIC SNIPER
+# ============================================================
+
+async def sniper_job(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    try:
-
-        await asyncio.to_thread(
-            get_major_markets,
-            True,
-        )
-
-        print(
-            "Major market cache refreshed."
-        )
-
-    except Exception as error:
-
-        print(
-            "market_refresh_job error:",
-            repr(error),
-        )
-
-
-# =========================================================
-# AUTO MEME SCAN
-# =========================================================
-
-async def auto_meme_scan(
-    context: ContextTypes.DEFAULT_TYPE,
-):
+    global last_scan_time
+    global last_scan_candidates
+    global last_scan_best
 
     chat_id = (
         context.job.chat_id
@@ -1652,299 +1517,204 @@ async def auto_meme_scan(
 
     try:
 
-        results = await asyncio.to_thread(
-            get_ranked_memes
-        )
-
-        if SEND_SCAN_SUMMARIES:
-
-            if results:
-
-                best = results[0]
-
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "🔎 AUTO SOLANA SCAN\n\n"
-                        f"Candidates: {len(results)}\n"
-                        f"Best: {best['name']} "
-                        f"({best['symbol']})\n"
-                        f"Score: {best['score']}/100\n"
-                        f"Signal: {best['label']}\n"
-                        f"Market cap: "
-                        f"${best['market_cap']:,.0f}\n"
-                        f"Liquidity: "
-                        f"${best['liquidity']:,.0f}\n"
-                        f"1h volume: "
-                        f"${best['volume_1h']:,.0f}"
-                    ),
-                )
-
-            else:
-
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "🔎 AUTO SOLANA SCAN\n\n"
-                        "No candidates currently "
-                        "pass the filters."
-                    ),
-                )
-
-        if meme_positions:
-            return
-
-        eligible = [
-            candidate
-            for candidate in results
-            if (
-                candidate["score"]
-                >= MEME_ENTRY_SCORE
-            )
-        ]
-
-        if not eligible:
-            return
-
-        position = (
-            open_meme_trade(
-                eligible[0]
-            )
-        )
-
-        if position:
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "📥 MEME PAPER BUY\n\n"
-                    f"{position['name']} "
-                    f"({position['symbol']})\n"
-                    f"Score: "
-                    f"{position['score']}/100\n"
-                    f"Size: "
-                    f"${position['cost']:.2f}\n"
-                    f"Entry: "
-                    f"${position['entry_price']:.10f}\n"
-                    f"TP: "
-                    f"+{MEME_TAKE_PROFIT:.1f}%\n"
-                    f"SL: "
-                    f"-{MEME_STOP_LOSS:.1f}%"
-                ),
-            )
-
-    except Exception as error:
-
-        print(
-            "auto_meme_scan error:",
-            repr(error),
-        )
-
-
-# =========================================================
-# AUTO PERP SCAN
-# =========================================================
-
-async def auto_perp_scan(
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    chat_id = (
-        context.job.chat_id
-    )
-
-    try:
-
-        signals = await asyncio.to_thread(
-            get_major_signals
-        )
-
-        if SEND_SCAN_SUMMARIES:
-
-            lines = [
-                "📈 AUTO LONG/SHORT SCAN",
-                "",
-            ]
-
-            for signal in signals:
-
-                lines.append(
-                    (
-                        f"{signal['symbol']}: "
-                        f"{signal['side']} "
-                        f"{signal['score']}/100 | "
-                        f"1h "
-                        f"{signal['change_1h']:+.2f}% | "
-                        f"24h "
-                        f"{signal['change_24h']:+.2f}%"
-                    )
-                )
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="\n".join(
-                    lines
-                ),
-            )
-
-        if perp_positions:
-            return
-
-        eligible = [
-            signal
-            for signal in signals
-            if (
-                signal["side"]
-                in (
-                    "LONG",
-                    "SHORT",
-                )
-                and signal["score"]
-                >= PERP_ENTRY_SCORE
-            )
-        ]
-
-        if not eligible:
-            return
-
-        position = (
-            open_perp_trade(
-                eligible[0]
-            )
-        )
-
-        if position:
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "📥 PAPER LONG/SHORT OPEN\n\n"
-                    f"{position['symbol']} "
-                    f"{position['side']}\n"
-                    f"Score: "
-                    f"{position['score']}/100\n"
-                    f"Entry: "
-                    f"${position['entry_price']:,.4f}\n"
-                    f"Collateral: "
-                    f"${position['collateral']:.2f} USDC\n"
-                    f"Leverage: "
-                    f"{PERP_LEVERAGE:.1f}x\n"
-                    f"TP: "
-                    f"+{PERP_TAKE_PROFIT:.1f}%\n"
-                    f"SL: "
-                    f"-{PERP_STOP_LOSS:.1f}%"
-                ),
-            )
-
-    except Exception as error:
-
-        print(
-            "auto_perp_scan error:",
-            repr(error),
-        )
-
-
-# =========================================================
-# ICP ALERT
-# =========================================================
-
-async def icp_alert_job(
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    global last_icp_alert_time
-    global last_icp_alert_direction
-
-    chat_id = (
-        context.job.chat_id
-    )
-
-    try:
-
-        market = (
+        rankings = (
             await asyncio.to_thread(
-                get_major_markets
+                get_rankings
             )
-        ).get("ICP")
-
-        if not market:
-            return
-
-        direction = None
-
-        if (
-            market["change_1h"]
-            >= ICP_ALERT_1H_PERCENT
-            or market["change_24h"]
-            >= ICP_ALERT_24H_PERCENT
-        ):
-
-            direction = "UP"
-
-        elif (
-            market["change_1h"]
-            <= -ICP_ALERT_1H_PERCENT
-            or market["change_24h"]
-            <= -ICP_ALERT_24H_PERCENT
-        ):
-
-            direction = "DOWN"
-
-        if not direction:
-            return
-
-        now = time.time()
-
-        if (
-            direction
-            == last_icp_alert_direction
-            and (
-                now
-                - last_icp_alert_time
-            )
-            < ICP_ALERT_COOLDOWN
-        ):
-
-            return
-
-        last_icp_alert_time = now
-        last_icp_alert_direction = (
-            direction
         )
 
-        emoji = (
-            "🚀"
-            if direction == "UP"
-            else "🔻"
+    except Exception as error:
+
+        print(
+            "Sniper scan error:",
+            repr(error),
         )
+
+        return
+
+    last_scan_time = (
+        time.time()
+    )
+
+    last_scan_candidates = (
+        len(rankings)
+    )
+
+    last_scan_best = (
+        rankings[0]
+        if rankings
+        else None
+    )
+
+    scan_log.append(
+        {
+            "time":
+                last_scan_time,
+
+            "candidates":
+                len(rankings),
+
+            "best_score":
+                (
+                    rankings[0]["score"]
+                    if rankings
+                    else 0
+                ),
+        }
+    )
+
+    if not rankings:
+        return
+
+
+    # --------------------------------------------------------
+    # WATCH BEST COIN
+    # --------------------------------------------------------
+
+    best = rankings[0]
+
+    if (
+        best["score"]
+        >= WATCH_SCORE
+    ):
+
+        last_alert = (
+            recent_watch_alerts.get(
+                best["address"],
+                0,
+            )
+        )
+
+        if (
+            time.time()
+            - last_alert
+            >= WATCH_COOLDOWN
+        ):
+
+            recent_watch_alerts[
+                best["address"]
+            ] = time.time()
+
+            await context.bot.send_message(
+
+                chat_id=chat_id,
+
+                text=(
+                    "🎯 NEW COIN WATCH\n\n"
+
+                    f"{best['name']} "
+                    f"({best['symbol']})\n"
+
+                    f"Score: "
+                    f"{best['score']}/100\n"
+
+                    f"Age: "
+                    f"{best['age']:.1f} min\n"
+
+                    f"MC: "
+                    f"${best['market_cap']:,.0f}\n"
+
+                    f"Liquidity: "
+                    f"${best['liquidity']:,.0f}\n"
+
+                    f"5m volume: "
+                    f"${best['volume_5m']:,.0f}\n"
+
+                    f"5m buys/sells: "
+                    f"{best['buys_5m']}/"
+                    f"{best['sells_5m']}\n"
+
+                    f"5m move: "
+                    f"{best['change_5m']:+.2f}%"
+                ),
+            )
+
+
+    # --------------------------------------------------------
+    # MULTIPLE ENTRIES
+    # --------------------------------------------------------
+
+    available_slots = (
+
+        MAX_OPEN_POSITIONS
+        - len(positions)
+    )
+
+    if available_slots <= 0:
+        return
+
+    eligible = [
+
+        coin
+
+        for coin
+        in rankings
+
+        if (
+            coin["score"]
+            >= ENTRY_SCORE
+        )
+    ]
+
+    if not eligible:
+        return
+
+    # Can open more than one candidate from a single scan
+    # if several genuinely qualify.
+    for coin in eligible[
+        :available_slots
+    ]:
+
+        position = (
+            open_trade(
+                coin
+            )
+        )
+
+        if not position:
+            continue
 
         await context.bot.send_message(
+
             chat_id=chat_id,
+
             text=(
-                f"{emoji} ICP ALERT — "
-                f"{direction}\n\n"
-                f"Price: "
-                f"${market['price']:.4f}\n"
-                f"1h: "
-                f"{market['change_1h']:+.2f}%\n"
-                f"24h: "
-                f"{market['change_24h']:+.2f}%"
+                "⚡🎯 PAPER SNIPE\n\n"
+
+                f"{position['name']} "
+                f"({position['symbol']})\n"
+
+                f"Score: "
+                f"{position['score']}/100\n"
+
+                f"Paper stake: "
+                f"${position['trade_size']:.2f}\n"
+
+                f"Quote: "
+                f"${position['entry_quote']:.10f}\n"
+
+                f"Simulated entry: "
+                f"${position['entry_price']:.10f}\n"
+
+                f"MC: "
+                f"${position['market_cap']:,.0f}\n"
+
+                f"Liquidity: "
+                f"${position['liquidity']:,.0f}\n\n"
+
+                f"TP: +{TAKE_PROFIT:.1f}%\n"
+                f"SL: -{STOP_LOSS:.1f}%\n"
+                f"Max hold: "
+                f"{MAX_HOLD_MINUTES} min"
             ),
         )
 
-    except Exception as error:
 
-        print(
-            "icp_alert_job error:",
-            repr(error),
-        )
-
-
-# =========================================================
+# ============================================================
 # POSITION MONITOR
-# =========================================================
+# ============================================================
 
-async def monitor_positions(
+async def monitor_job(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
@@ -1953,11 +1723,11 @@ async def monitor_positions(
     )
 
     for address in list(
-        meme_positions
+        positions.keys()
     ):
 
         position = (
-            meme_positions.get(
+            positions.get(
                 address
             )
         )
@@ -1967,9 +1737,9 @@ async def monitor_positions(
 
         try:
 
-            current_price = (
+            quote = (
                 await asyncio.to_thread(
-                    get_solana_token_price,
+                    get_token_price,
                     address,
                 )
             )
@@ -1977,205 +1747,222 @@ async def monitor_positions(
         except Exception as error:
 
             print(
-                "meme monitor error:",
+                "Monitor error:",
                 repr(error),
             )
 
             continue
 
-        if not current_price:
+        if not quote:
             continue
 
-        pnl_pct = (
-            current_price
-            - position["entry_price"]
-        ) / position["entry_price"] * 100
 
-        minutes_open = (
+        # ----------------------------------------------------
+        # NEW HIGH
+        # ----------------------------------------------------
+
+        if (
+            quote
+            > position[
+                "highest_quote"
+            ]
+        ):
+
+            position[
+                "highest_quote"
+            ] = quote
+
+
+        # ----------------------------------------------------
+        # CURRENT NET P/L
+        # ----------------------------------------------------
+
+        result = (
+            estimate_exit(
+                position,
+                quote,
+            )
+        )
+
+        pnl_pct = (
+            result["pnl_pct"]
+        )
+
+
+        # ----------------------------------------------------
+        # ACTIVATE TRAILING
+        # ----------------------------------------------------
+
+        high_gain = (
+
+            (
+                position[
+                    "highest_quote"
+                ]
+
+                - position[
+                    "entry_quote"
+                ]
+            )
+
+            / position[
+                "entry_quote"
+            ]
+
+            * 100
+        )
+
+        if (
+            high_gain
+            >= TRAIL_ACTIVATION
+        ):
+
+            position[
+                "trailing"
+            ] = True
+
+
+        # ----------------------------------------------------
+        # DRAWDOWN FROM HIGH
+        # ----------------------------------------------------
+
+        high = position[
+            "highest_quote"
+        ]
+
+        drawdown = (
+
+            (
+                quote
+                - high
+            )
+
+            / high
+
+            * 100
+
+            if high > 0
+            else 0
+        )
+
+
+        # ----------------------------------------------------
+        # AGE
+        # ----------------------------------------------------
+
+        held_minutes = (
+
             time.time()
-            - position["opened_at"]
+
+            - position[
+                "opened_at"
+            ]
+
         ) / 60
+
+
+        # ----------------------------------------------------
+        # EXIT DECISION
+        # ----------------------------------------------------
 
         reason = None
 
         if (
             pnl_pct
-            >= MEME_TAKE_PROFIT
+            >= TAKE_PROFIT
         ):
 
-            reason = "TAKE PROFIT"
+            reason = (
+                "TAKE PROFIT"
+            )
 
         elif (
             pnl_pct
-            <= -MEME_STOP_LOSS
+            <= -STOP_LOSS
         ):
 
-            reason = "STOP LOSS"
+            reason = (
+                "STOP LOSS"
+            )
 
         elif (
-            minutes_open
-            >= MEME_MAX_HOLD_MINUTES
+
+            position[
+                "trailing"
+            ]
+
+            and (
+                drawdown
+                <= -TRAIL_DISTANCE
+            )
         ):
 
-            reason = "MAX HOLD"
-
-        if reason:
-
-            trade = (
-                close_meme_trade(
-                    address,
-                    current_price,
-                    reason,
-                )
+            reason = (
+                "TRAILING EXIT"
             )
 
-            if trade:
-
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "📤 MEME PAPER SELL\n\n"
-                        f"{trade['name']} "
-                        f"({trade['symbol']})\n"
-                        f"Reason: "
-                        f"{trade['reason']}\n"
-                        f"P/L: "
-                        f"${trade['pnl']:+.2f}\n"
-                        f"P/L %: "
-                        f"{trade['pnl_pct']:+.2f}%\n"
-                        f"Cash: "
-                        f"${meme_balance:.2f}"
-                    ),
-                )
-
-    markets = {}
-
-    if perp_positions:
-
-        try:
-
-            markets = (
-                await asyncio.to_thread(
-                    get_major_markets
-                )
-            )
-
-        except Exception as error:
-
-            print(
-                "perp monitor market error:",
-                repr(error),
-            )
-
-    for symbol in list(
-        perp_positions
-    ):
-
-        position = (
-            perp_positions.get(
-                symbol
-            )
-        )
-
-        market = markets.get(
-            symbol
-        )
-
-        if (
-            not position
-            or not market
-            or not market["price"]
+        elif (
+            held_minutes
+            >= MAX_HOLD_MINUTES
         ):
 
+            reason = (
+                "TIME EXIT"
+            )
+
+        if not reason:
             continue
 
-        current_price = (
-            market["price"]
-        )
 
-        if (
-            position["side"]
-            == "LONG"
-        ):
+        # ----------------------------------------------------
+        # CLOSE
+        # ----------------------------------------------------
 
-            raw_pct = (
-                current_price
-                - position["entry_price"]
-            ) / position["entry_price"] * 100
-
-        else:
-
-            raw_pct = (
-                position["entry_price"]
-                - current_price
-            ) / position["entry_price"] * 100
-
-        pnl_pct = (
-            raw_pct
-            * PERP_LEVERAGE
-        )
-
-        minutes_open = (
-            time.time()
-            - position["opened_at"]
-        ) / 60
-
-        reason = None
-
-        if (
-            pnl_pct
-            >= PERP_TAKE_PROFIT
-        ):
-
-            reason = "TAKE PROFIT"
-
-        elif (
-            pnl_pct
-            <= -PERP_STOP_LOSS
-        ):
-
-            reason = "STOP LOSS"
-
-        elif (
-            minutes_open
-            >= PERP_MAX_HOLD_MINUTES
-        ):
-
-            reason = "MAX HOLD"
-
-        if reason:
-
-            trade = (
-                close_perp_trade(
-                    symbol,
-                    current_price,
-                    reason,
-                )
+        trade = (
+            close_trade(
+                address,
+                quote,
+                reason,
             )
+        )
 
-            if trade:
+        if not trade:
+            continue
 
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "📤 PAPER LONG/SHORT CLOSE\n\n"
-                        f"{trade['symbol']} "
-                        f"{trade['side']}\n"
-                        f"Reason: "
-                        f"{trade['reason']}\n"
-                        f"Net P/L: "
-                        f"${trade['net_pnl']:+.2f}\n"
-                        f"P/L: "
-                        f"{trade['pnl_pct']:+.2f}%\n"
-                        f"Balance: "
-                        f"${perp_balance:.2f} USDC"
-                    ),
-                )
+        icon = (
+            "🟢"
+            if trade["pnl"] >= 0
+            else "🔴"
+        )
+
+        await context.bot.send_message(
+
+            chat_id=chat_id,
+
+            text=(
+                f"{icon} PAPER SNIPE CLOSED\n\n"
+
+                f"{trade['name']} "
+                f"({trade['symbol']})\n"
+
+                f"Exit: "
+                f"{trade['reason']}\n"
+
+                f"Net return: "
+                f"{trade['pnl_pct']:+.2f}%\n"
+
+                f"P/L: "
+                f"${trade['pnl']:+.2f}\n"
+
+                f"Paper cash: "
+                f"${paper_cash:.2f}"
+            ),
+        )
 
 
-# =========================================================
-# JOB SCHEDULER
-# =========================================================
+# ============================================================
+# SCHEDULE JOBS
+# ============================================================
 
 def schedule_jobs(
     job_queue,
@@ -2186,102 +1973,124 @@ def schedule_jobs(
         chat_id
     )
 
-    jobs = [
-        (
-            market_refresh_job,
-            f"market_refresh_{chat_id}",
-            AUTO_SCAN_INTERVAL,
-            5,
-        ),
-        (
-            auto_meme_scan,
-            f"auto_meme_{chat_id}",
-            AUTO_SCAN_INTERVAL,
-            FIRST_MEME_SCAN,
-        ),
-        (
-            auto_perp_scan,
-            f"auto_perp_{chat_id}",
-            AUTO_SCAN_INTERVAL,
-            FIRST_PERP_SCAN,
-        ),
-        (
-            monitor_positions,
-            f"monitor_{chat_id}",
-            POSITION_MONITOR_INTERVAL,
-            POSITION_MONITOR_INTERVAL,
-        ),
-        (
-            icp_alert_job,
-            f"icp_alert_{chat_id}",
-            AUTO_SCAN_INTERVAL,
-            120,
-        ),
-    ]
+    sniper_name = (
+        f"sniper_{chat_id}"
+    )
 
-    for (
-        callback,
-        name,
-        interval,
-        first,
-    ) in jobs:
+    monitor_name = (
+        f"monitor_{chat_id}"
+    )
 
-        if not (
-            job_queue
-            .get_jobs_by_name(
-                name
-            )
-        ):
+    if not (
+        job_queue
+        .get_jobs_by_name(
+            sniper_name
+        )
+    ):
 
-            job_queue.run_repeating(
-                callback,
-                interval=interval,
-                first=first,
-                chat_id=chat_id,
-                name=name,
-            )
+        job_queue.run_repeating(
+
+            sniper_job,
+
+            interval=
+                SCAN_INTERVAL,
+
+            first=
+                FIRST_SCAN_DELAY,
+
+            chat_id=
+                chat_id,
+
+            name=
+                sniper_name,
+        )
+
+    if not (
+        job_queue
+        .get_jobs_by_name(
+            monitor_name
+        )
+    ):
+
+        job_queue.run_repeating(
+
+            monitor_job,
+
+            interval=
+                MONITOR_INTERVAL,
+
+            first=
+                MONITOR_INTERVAL,
+
+            chat_id=
+                chat_id,
+
+            name=
+                monitor_name,
+        )
 
 
-# =========================================================
+# ============================================================
 # STARTUP
-# =========================================================
+# ============================================================
 
 async def post_init(
     application,
 ):
 
-    if TELEGRAM_CHAT_ID:
+    if not CHAT_ID:
 
-        try:
+        print(
+            "TELEGRAM_CHAT_ID not set."
+        )
 
-            chat_id = int(
-                TELEGRAM_CHAT_ID
-            )
+        return
 
-            schedule_jobs(
-                application.job_queue,
-                chat_id,
-            )
+    try:
 
-            await application.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "♻️ Caltanide Jarvis restarted.\n"
-                    "✅ Background jobs are active."
-                ),
-            )
+        chat_id = int(
+            CHAT_ID
+        )
 
-        except Exception as error:
+        schedule_jobs(
+            application.job_queue,
+            chat_id,
+        )
 
-            print(
-                "post_init error:",
-                repr(error),
-            )
+        await application.bot.send_message(
+
+            chat_id=chat_id,
+
+            text=(
+                "🎯 NEW COIN PAPER SNIPER ONLINE\n\n"
+
+                "Scan: every "
+                f"{SCAN_INTERVAL}s\n"
+
+                "Position check: every "
+                f"{MONITOR_INTERVAL}s\n"
+
+                "Max positions: "
+                f"{MAX_OPEN_POSITIONS}\n"
+
+                "Stake: "
+                f"${TRADE_SIZE:.2f} each\n"
+
+                "Mode: PAPER MONEY"
+            ),
+        )
+
+    except Exception as error:
+
+        print(
+            "Startup error:",
+            repr(error),
+        )
 
 
-# =========================================================
-# COMMANDS
-# =========================================================
+# ============================================================
+# /START
+# ============================================================
 
 async def start(
     update: Update,
@@ -2294,28 +2103,24 @@ async def start(
     )
 
     await update.message.reply_text(
-        "🤖 CALTANIDE JARVIS PAPER TRADER\n\n"
-        "✅ Paper trading only.\n"
-        "✅ Background scanners active.\n\n"
-        "SYSTEM\n"
+        "🎯 NEW COIN PAPER SNIPER\n\n"
+
+        "Commands:\n"
         "/status\n"
-        "/chatid\n\n"
-        "SOLANA MEMES\n"
-        "/hunt\n"
-        "/paper\n"
+        "/snipe\n"
         "/positions\n"
-        "/history\n\n"
-        "BTC / ETH / SOL / ICP\n"
-        "/perpscan\n"
-        "/perpaccount\n"
-        "/perppositions\n"
-        "/perphistory\n\n"
-        "OTHER\n"
-        "/icp\n"
-        "/price bitcoin\n"
-        "/analyse bitcoin"
+        "/account\n"
+        "/history\n"
+        "/stats\n"
+        "/chatid\n\n"
+
+        "Automatic paper sniping is active."
     )
 
+
+# ============================================================
+# /CHATID
+# ============================================================
 
 async def chatid(
     update: Update,
@@ -2323,12 +2128,14 @@ async def chatid(
 ):
 
     await update.message.reply_text(
-        "🆔 Telegram chat ID:\n"
-        f"{update.effective_chat.id}\n\n"
-        "Put this number in Railway as:\n"
-        "TELEGRAM_CHAT_ID"
+        f"Chat ID:\n"
+        f"{update.effective_chat.id}"
     )
 
+
+# ============================================================
+# /STATUS
+# ============================================================
 
 async def status(
     update: Update,
@@ -2339,242 +2146,175 @@ async def status(
         context.job_queue.jobs()
     )
 
-    if market_cache_updated_at:
+    if last_scan_time:
 
-        cache_age = int(
+        seconds = int(
             time.time()
-            - market_cache_updated_at
+            - last_scan_time
+        )
+
+        scan_status = (
+            f"{seconds}s ago"
         )
 
     else:
 
-        cache_age = None
-
-    message = (
-        "🟢 JARVIS STATUS\n\n"
-        f"Background jobs: "
-        f"{len(jobs)}\n"
-        f"Meme cash: "
-        f"${meme_balance:.2f}\n"
-        f"Meme open positions: "
-        f"{len(meme_positions)}\n"
-        f"Meme closed trades: "
-        f"{len(meme_history)}\n\n"
-        f"Perp cash: "
-        f"${perp_balance:.2f} USDC\n"
-        f"Perp open positions: "
-        f"{len(perp_positions)}\n"
-        f"Perp closed trades: "
-        f"{len(perp_history)}\n\n"
-        f"Market cache: "
-        f"{'ready' if market_cache else 'empty'}"
-    )
-
-    if (
-        cache_age
-        is not None
-    ):
-
-        message += (
-            f" ({cache_age}s old)"
+        scan_status = (
+            "waiting for first scan"
         )
 
-    message += "\n\nJobs:\n"
+    if last_scan_best:
 
-    if jobs:
-
-        message += "\n".join(
-            f"✅ {job.name}"
-            for job in jobs
+        best = (
+            f"{last_scan_best['symbol']} "
+            f"{last_scan_best['score']}/100"
         )
 
     else:
 
-        message += "❌ none"
+        best = "none"
 
     await update.message.reply_text(
-        message
+        "🟢 SNIPER STATUS\n\n"
+
+        f"Jobs running: "
+        f"{len(jobs)}\n"
+
+        f"Scanner interval: "
+        f"{SCAN_INTERVAL}s\n"
+
+        f"Monitor interval: "
+        f"{MONITOR_INTERVAL}s\n"
+
+        f"Last scan: "
+        f"{scan_status}\n"
+
+        f"Candidates: "
+        f"{last_scan_candidates}\n"
+
+        f"Best: "
+        f"{best}\n\n"
+
+        f"Cash: "
+        f"${paper_cash:.2f}\n"
+
+        f"Open positions: "
+        f"{len(positions)}/"
+        f"{MAX_OPEN_POSITIONS}\n"
+
+        f"Completed trades: "
+        f"{len(history)}\n\n"
+
+        f"Entry score: "
+        f"{ENTRY_SCORE}/100"
     )
 
 
-async def hunt(
+# ============================================================
+# /SNIPE
+# ============================================================
+
+async def snipe(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
     await update.message.reply_text(
-        "🔎 Jarvis is scanning Solana..."
+        "🎯 Running new-coin scan..."
     )
 
     try:
 
-        results = await asyncio.to_thread(
-            get_ranked_memes
-        )
-
-        if not results:
-
-            await update.message.reply_text(
-                "🔎 JARVIS SOLANA HUNT\n\n"
-                "No tokens currently pass the filters."
+        rankings = (
+            await asyncio.to_thread(
+                get_rankings
             )
-
-            return
-
-        lines = [
-            "🚨 JARVIS SOLANA HUNT",
-            "",
-        ]
-
-        for (
-            index,
-            candidate,
-        ) in enumerate(
-            results[:5],
-            1,
-        ):
-
-            lines.extend(
-                [
-                    (
-                        f"{index}. "
-                        f"{candidate['name']} "
-                        f"({candidate['symbol']})"
-                    ),
-                    (
-                        f"Score: "
-                        f"{candidate['score']}/100"
-                    ),
-                    (
-                        f"Signal: "
-                        f"{candidate['label']}"
-                    ),
-                    (
-                        f"Price: "
-                        f"${candidate['price']:.10f}"
-                    ),
-                    (
-                        f"Market cap: "
-                        f"${candidate['market_cap']:,.0f}"
-                    ),
-                    (
-                        f"Liquidity: "
-                        f"${candidate['liquidity']:,.0f}"
-                    ),
-                    (
-                        f"1h volume: "
-                        f"${candidate['volume_1h']:,.0f}"
-                    ),
-                    (
-                        f"Token: "
-                        f"{candidate['address']}"
-                    ),
-                    "",
-                ]
-            )
-
-        await update.message.reply_text(
-            "\n".join(lines)[:4000]
         )
 
     except Exception as error:
 
         print(
-            "hunt error:",
+            "/snipe error:",
             repr(error),
         )
 
         await update.message.reply_text(
-            "⚠️ Solana scan temporarily unavailable."
+            "Scanner temporarily unavailable."
         )
 
+        return
 
-async def paper(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    realized = sum(
-        trade["pnl"]
-        for trade in meme_history
-    )
-
-    await update.message.reply_text(
-        "💵 MEME PAPER ACCOUNT\n\n"
-        f"Cash: "
-        f"${meme_balance:.2f}\n"
-        f"Open positions: "
-        f"{len(meme_positions)}\n"
-        f"Closed trades: "
-        f"{len(meme_history)}\n"
-        f"Realized P/L: "
-        f"${realized:+.2f}"
-    )
-
-
-async def positions(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not meme_positions:
+    if not rankings:
 
         await update.message.reply_text(
-            "No meme paper positions open."
+            "No new coins currently "
+            "pass the sniper filters."
         )
 
         return
 
     lines = [
-        "📊 MEME PAPER POSITIONS",
+        "🎯 TOP SNIPER CANDIDATES",
         "",
     ]
 
-    for position in (
-        meme_positions.values()
+    for (
+        index,
+        coin,
+    ) in enumerate(
+        rankings[:8],
+        1,
     ):
-
-        try:
-
-            current = (
-                await asyncio.to_thread(
-                    get_solana_token_price,
-                    position["address"],
-                )
-            )
-
-        except Exception:
-
-            current = None
-
-        if current:
-
-            pnl = (
-                current
-                - position["entry_price"]
-            ) / position["entry_price"] * 100
-
-        else:
-
-            pnl = 0
 
         lines.extend(
             [
                 (
-                    f"{position['name']} "
-                    f"({position['symbol']})"
+                    f"{index}. "
+                    f"{coin['name']} "
+                    f"({coin['symbol']})"
                 ),
+
                 (
-                    f"Entry: "
-                    f"${position['entry_price']:.10f}"
+                    f"Score: "
+                    f"{coin['score']}/100"
                 ),
+
                 (
-                    f"Current: "
-                    f"${current:.10f}"
-                    if current
-                    else "Current: unavailable"
+                    f"Age: "
+                    f"{coin['age']:.1f}m"
                 ),
-                f"P/L: {pnl:+.2f}%",
+
+                (
+                    f"MC: "
+                    f"${coin['market_cap']:,.0f}"
+                ),
+
+                (
+                    f"Liq: "
+                    f"${coin['liquidity']:,.0f}"
+                ),
+
+                (
+                    f"5m vol: "
+                    f"${coin['volume_5m']:,.0f}"
+                ),
+
+                (
+                    f"B/S: "
+                    f"{coin['buys_5m']}/"
+                    f"{coin['sells_5m']}"
+                ),
+
+                (
+                    f"5m: "
+                    f"{coin['change_5m']:+.2f}%"
+                ),
+
+                (
+                    f"Token: "
+                    f"{coin['address']}"
+                ),
+
                 "",
             ]
         )
@@ -2584,292 +2324,225 @@ async def positions(
     )
 
 
-async def history(
+# ============================================================
+# /POSITIONS
+# ============================================================
+
+async def positions_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not meme_history:
+    if not positions:
 
         await update.message.reply_text(
-            "No completed meme paper trades yet."
+            "No paper positions open."
         )
 
         return
 
     lines = [
-        "📚 MEME PAPER HISTORY",
+        "🎯 OPEN PAPER SNIPES",
         "",
     ]
 
-    for trade in (
-        meme_history[-10:]
+    for position in list(
+        positions.values()
     ):
 
-        lines.extend(
-            [
-                (
-                    f"{trade['name']} "
-                    f"({trade['symbol']})"
-                ),
-                (
-                    f"P/L: "
-                    f"{trade['pnl_pct']:+.2f}%"
-                ),
-                (
-                    f"Profit/Loss: "
-                    f"${trade['pnl']:+.2f}"
-                ),
-                (
-                    f"Exit: "
-                    f"{trade['reason']}"
-                ),
-                "",
-            ]
-        )
+        try:
 
-    await update.message.reply_text(
-        "\n".join(lines)
-    )
-
-
-async def perpscan(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    try:
-
-        signals = await asyncio.to_thread(
-            get_major_signals
-        )
-
-        lines = [
-            "📈 PAPER LONG/SHORT SCANNER",
-            "",
-            "Assets: BTC / ETH / SOL / ICP",
-            (
-                f"Entry threshold: "
-                f"{PERP_ENTRY_SCORE}/100"
-            ),
-            (
-                f"Leverage: "
-                f"{PERP_LEVERAGE:.1f}x"
-            ),
-            "",
-        ]
-
-        for signal in signals:
-
-            lines.extend(
-                [
-                    (
-                        f"{signal['symbol']} — "
-                        f"{signal['side']}"
-                    ),
-                    (
-                        f"Score: "
-                        f"{signal['score']}/100"
-                    ),
-                    (
-                        f"Price: "
-                        f"${signal['price']:,.4f}"
-                    ),
-                    (
-                        f"1h: "
-                        f"{signal['change_1h']:+.2f}%"
-                    ),
-                    (
-                        f"24h: "
-                        f"{signal['change_24h']:+.2f}%"
-                    ),
-                    "",
-                ]
+            quote = (
+                await asyncio.to_thread(
+                    get_token_price,
+                    position["address"],
+                )
             )
 
-        await update.message.reply_text(
-            "\n".join(lines)
-        )
+        except Exception:
 
-    except Exception as error:
+            quote = None
 
-        print(
-            "perpscan error:",
-            repr(error),
-        )
+        if quote:
 
-        await update.message.reply_text(
-            "⚠️ Market data unavailable right now. "
-            "Jarvis will retry automatically."
-        )
+            result = (
+                estimate_exit(
+                    position,
+                    quote,
+                )
+            )
 
-
-async def perpaccount(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    realized = sum(
-        trade["net_pnl"]
-        for trade in perp_history
-    )
-
-    await update.message.reply_text(
-        "💵 PAPER LONG/SHORT ACCOUNT\n\n"
-        f"USDC cash: "
-        f"${perp_balance:.2f}\n"
-        f"Open positions: "
-        f"{len(perp_positions)}\n"
-        f"Closed trades: "
-        f"{len(perp_history)}\n"
-        f"Realized P/L: "
-        f"${realized:+.2f}\n"
-        f"Leverage: "
-        f"{PERP_LEVERAGE:.1f}x"
-    )
-
-
-async def perppositions(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not perp_positions:
-
-        await update.message.reply_text(
-            "No paper long/short positions open."
-        )
-
-        return
-
-    try:
-
-        markets = await asyncio.to_thread(
-            get_major_markets
-        )
-
-    except Exception:
-
-        markets = {}
-
-    lines = [
-        "📊 OPEN PAPER LONG/SHORT",
-        "",
-    ]
-
-    for position in (
-        perp_positions.values()
-    ):
-
-        market = markets.get(
-            position["symbol"]
-        )
-
-        current = (
-            market["price"]
-            if market
-            else None
-        )
-
-        if current:
-
-            if (
-                position["side"]
-                == "LONG"
-            ):
-
-                raw = (
-                    current
-                    - position["entry_price"]
-                ) / position["entry_price"]
-
-            else:
-
-                raw = (
-                    position["entry_price"]
-                    - current
-                ) / position["entry_price"]
-
-            pnl = (
-                raw
-                * 100
-                * PERP_LEVERAGE
+            pnl_text = (
+                f"{result['pnl_pct']:+.2f}% "
+                f"(${result['pnl']:+.2f})"
             )
 
         else:
 
-            pnl = 0
+            pnl_text = (
+                "price unavailable"
+            )
+
+        held = (
+
+            time.time()
+
+            - position[
+                "opened_at"
+            ]
+
+        ) / 60
 
         lines.extend(
             [
                 (
-                    f"{position['symbol']} "
-                    f"{position['side']}"
+                    f"{position['name']} "
+                    f"({position['symbol']})"
                 ),
+
+                (
+                    f"Score: "
+                    f"{position['score']}/100"
+                ),
+
                 (
                     f"Entry: "
-                    f"${position['entry_price']:,.4f}"
+                    f"${position['entry_price']:.10f}"
                 ),
+
                 (
-                    f"Current: "
-                    f"${current:,.4f}"
-                    if current
-                    else "Current: unavailable"
+                    f"P/L: "
+                    f"{pnl_text}"
                 ),
-                f"P/L: {pnl:+.2f}%",
+
                 (
-                    f"Collateral: "
-                    f"${position['collateral']:.2f}"
+                    f"Held: "
+                    f"{held:.1f} min"
                 ),
+
                 "",
             ]
         )
 
     await update.message.reply_text(
-        "\n".join(lines)
+        "\n".join(lines)[:4000]
     )
 
 
-async def perphistory(
+# ============================================================
+# /ACCOUNT
+# ============================================================
+
+async def account(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not perp_history:
+    wins = sum(
+        1
+        for trade
+        in history
+        if trade["pnl"] > 0
+    )
+
+    losses = (
+        len(history)
+        - wins
+    )
+
+    realized = sum(
+        trade["pnl"]
+        for trade
+        in history
+    )
+
+    win_rate = (
+
+        wins
+        / len(history)
+        * 100
+
+        if history
+        else 0
+    )
+
+    await update.message.reply_text(
+        "💵 PAPER SNIPER ACCOUNT\n\n"
+
+        f"Starting balance: "
+        f"${STARTING_BALANCE:.2f}\n"
+
+        f"Cash: "
+        f"${paper_cash:.2f}\n"
+
+        f"Open: "
+        f"{len(positions)}\n"
+
+        f"Closed: "
+        f"{len(history)}\n"
+
+        f"Wins: "
+        f"{wins}\n"
+
+        f"Losses: "
+        f"{losses}\n"
+
+        f"Win rate: "
+        f"{win_rate:.1f}%\n"
+
+        f"Realized P/L: "
+        f"${realized:+.2f}"
+    )
+
+
+# ============================================================
+# /HISTORY
+# ============================================================
+
+async def history_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not history:
 
         await update.message.reply_text(
-            "No completed paper long/short trades yet."
+            "No completed paper trades yet."
         )
 
         return
 
     lines = [
-        "📚 PAPER LONG/SHORT HISTORY",
+        "📚 RECENT SNIPES",
         "",
     ]
 
     for trade in (
-        perp_history[-10:]
+        history[-15:]
     ):
+
+        icon = (
+            "🟢"
+            if trade["pnl"] >= 0
+            else "🔴"
+        )
 
         lines.extend(
             [
                 (
-                    f"{trade['symbol']} "
-                    f"{trade['side']}"
+                    f"{icon} "
+                    f"{trade['symbol']}"
                 ),
+
                 (
-                    f"P/L: "
-                    f"{trade['pnl_pct']:+.2f}%"
-                ),
-                (
-                    f"Profit/Loss: "
-                    f"${trade['net_pnl']:+.2f}"
-                ),
-                (
-                    f"Exit: "
                     f"{trade['reason']}"
                 ),
+
+                (
+                    f"{trade['pnl_pct']:+.2f}% "
+                    f"(${trade['pnl']:+.2f})"
+                ),
+
                 "",
             ]
         )
@@ -2879,228 +2552,113 @@ async def perphistory(
     )
 
 
-async def icp(
+# ============================================================
+# /STATS
+# ============================================================
+
+async def stats(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    try:
-
-        market = (
-            await asyncio.to_thread(
-                get_major_markets
-            )
-        ).get("ICP")
-
-        if not market:
-
-            await update.message.reply_text(
-                "ICP data unavailable."
-            )
-
-            return
-
-        (
-            side,
-            score,
-        ) = score_major_market(
-            market
-        )
+    if not history:
 
         await update.message.reply_text(
-            "🟣 ICP STATUS\n\n"
-            f"Price: "
-            f"${market['price']:.4f}\n"
-            f"1h: "
-            f"{market['change_1h']:+.2f}%\n"
-            f"24h: "
-            f"{market['change_24h']:+.2f}%\n"
-            f"Direction: "
-            f"{side}\n"
-            f"Score: "
-            f"{score}/100"
-        )
-
-    except Exception as error:
-
-        print(
-            "icp error:",
-            repr(error),
-        )
-
-        await update.message.reply_text(
-            "ICP data temporarily unavailable. "
-            "Jarvis will retry automatically."
-        )
-
-
-async def price(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "Try: /price bitcoin"
+            "📊 No completed trades yet.\n"
+            "Let the paper sniper collect trades first."
         )
 
         return
 
-    symbol = coin_alias_to_symbol(
-        context.args[0]
+    returns = [
+        trade["pnl_pct"]
+        for trade
+        in history
+    ]
+
+    winners = [
+        value
+        for value
+        in returns
+        if value > 0
+    ]
+
+    losers = [
+        value
+        for value
+        in returns
+        if value <= 0
+    ]
+
+    average = (
+        sum(returns)
+        / len(returns)
     )
 
-    if not symbol:
-
-        await update.message.reply_text(
-            "Supported: BTC, ETH, SOL, ICP"
-        )
-
-        return
-
-    try:
-
-        market = (
-            await asyncio.to_thread(
-                get_major_markets
-            )
-        ).get(symbol)
-
-        if not market:
-
-            await update.message.reply_text(
-                "Price data unavailable."
-            )
-
-            return
-
-        await update.message.reply_text(
-            f"🪙 {market['name']} "
-            f"({symbol})\n\n"
-            f"Price: "
-            f"${market['price']:,.6f}\n"
-            f"1h: "
-            f"{market['change_1h']:+.2f}%\n"
-            f"24h: "
-            f"{market['change_24h']:+.2f}%\n"
-            f"Market cap: "
-            f"${market['market_cap']:,.0f}\n"
-            f"24h volume: "
-            f"${market['volume_24h']:,.0f}"
-        )
-
-    except Exception as error:
-
-        print(
-            "price error:",
-            repr(error),
-        )
-
-        await update.message.reply_text(
-            "Price data temporarily unavailable. "
-            "Jarvis is cooling down the market-data API."
-        )
-
-
-async def analyse(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "Try: /analyse bitcoin"
-        )
-
-        return
-
-    symbol = coin_alias_to_symbol(
-        context.args[0]
+    average_win = (
+        sum(winners)
+        / len(winners)
+        if winners
+        else 0
     )
 
-    if not symbol:
+    average_loss = (
+        sum(losers)
+        / len(losers)
+        if losers
+        else 0
+    )
 
-        await update.message.reply_text(
-            "Supported: BTC, ETH, SOL, ICP"
-        )
+    best = max(
+        returns
+    )
 
-        return
+    worst = min(
+        returns
+    )
 
-    try:
+    total_pnl = sum(
+        trade["pnl"]
+        for trade
+        in history
+    )
 
-        market = (
-            await asyncio.to_thread(
-                get_major_markets
-            )
-        ).get(symbol)
+    await update.message.reply_text(
+        "📊 SNIPER PERFORMANCE\n\n"
 
-        if not market:
+        f"Trades: "
+        f"{len(history)}\n"
 
-            await update.message.reply_text(
-                "Market data unavailable."
-            )
+        f"Average return: "
+        f"{average:+.2f}%\n"
 
-            return
+        f"Average winner: "
+        f"{average_win:+.2f}%\n"
 
-        prompt = f"""
-You are Caltanide Crypto Jarvis,
-a cautious cryptocurrency market-analysis assistant.
+        f"Average loser: "
+        f"{average_loss:+.2f}%\n"
 
-Asset: {market['name']} ({symbol})
-Price: {market['price']}
-1h change: {market['change_1h']}%
-24h change: {market['change_24h']}%
-Market cap: {market['market_cap']}
-24h volume: {market['volume_24h']}
+        f"Best trade: "
+        f"{best:+.2f}%\n"
 
-Give a concise analysis of:
-1. Momentum
-2. Volume
-3. Bullish case
-4. Bearish case
-5. Main risks
-6. Confirmation
-7. Invalidation
+        f"Worst trade: "
+        f"{worst:+.2f}%\n"
 
-Do not guarantee profits.
-Use only the supplied data.
-"""
-
-        response = await asyncio.to_thread(
-            client.responses.create,
-            model="gpt-5.6",
-            input=prompt,
-        )
-
-        await update.message.reply_text(
-            "🧠 CALTANIDE JARVIS ANALYSIS\n\n"
-            + response.output_text
-        )
-
-    except Exception as error:
-
-        print(
-            "analyse error:",
-            repr(error),
-        )
-
-        await update.message.reply_text(
-            "AI analysis temporarily unavailable."
-        )
+        f"Total realized: "
+        f"${total_pnl:+.2f}"
+    )
 
 
-# =========================================================
-# RUN
-# =========================================================
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
 
-    app = (
+    application = (
         Application.builder()
         .token(
-            TELEGRAM_TOKEN
+            BOT_TOKEN
         )
         .post_init(
             post_init
@@ -3108,43 +2666,67 @@ def main():
         .build()
     )
 
-    handlers = [
-        ("start", start),
-        ("status", status),
-        ("chatid", chatid),
-
-        ("hunt", hunt),
-        ("paper", paper),
-        ("positions", positions),
-        ("history", history),
-
-        ("perpscan", perpscan),
-        ("perpaccount", perpaccount),
-        ("perppositions", perppositions),
-        ("perphistory", perphistory),
-
-        ("icp", icp),
-        ("price", price),
-        ("analyse", analyse),
-    ]
-
-    for (
-        name,
-        function,
-    ) in handlers:
-
-        app.add_handler(
-            CommandHandler(
-                name,
-                function,
-            )
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start,
         )
-
-    print(
-        "Caltanide Jarvis PAPER trader online"
     )
 
-    app.run_polling(
+    application.add_handler(
+        CommandHandler(
+            "status",
+            status,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "snipe",
+            snipe,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "positions",
+            positions_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "account",
+            account,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "history",
+            history_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "stats",
+            stats,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "chatid",
+            chatid,
+        )
+    )
+
+    print(
+        "NEW COIN PAPER SNIPER ONLINE"
+    )
+
+    application.run_polling(
         drop_pending_updates=True
     )
 
