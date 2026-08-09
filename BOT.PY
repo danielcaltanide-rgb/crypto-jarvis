@@ -26,32 +26,31 @@ REQUEST_TIMEOUT = 15
 AUTO_HUNT_INTERVAL = 300
 AUTO_HUNT_FIRST_SCAN = 60
 
-PAPER_MONITOR_INTERVAL = 30
+POSITION_MONITOR_INTERVAL = 30
 
 
 # =========================================================
-# PAPER TRADING SETTINGS
+# SOLANA MEME PAPER SETTINGS
 # =========================================================
 
-PAPER_STARTING_BALANCE = 1000.00
-PAPER_TRADE_SIZE = 50.00
+MEME_STARTING_BALANCE = 1000.00
+MEME_TRADE_SIZE = 50.00
 
-# Looser threshold for paper testing
-PAPER_MIN_ENTRY_SCORE = 45
+MEME_ENTRY_SCORE = 45
 
-TAKE_PROFIT_PERCENT = 5.0
-STOP_LOSS_PERCENT = 2.0
+MEME_TAKE_PROFIT = 5.0
+MEME_STOP_LOSS = 2.0
+MEME_MAX_HOLD_MINUTES = 60
 
-MAX_HOLD_MINUTES = 60
-MAX_OPEN_POSITIONS = 1
+MEME_MAX_OPEN_POSITIONS = 1
 
-paper_balance = PAPER_STARTING_BALANCE
-paper_positions = {}
-paper_trade_history = []
+meme_balance = MEME_STARTING_BALANCE
+meme_positions = {}
+meme_history = []
 
 
 # =========================================================
-# PAPER TEST SCANNER FILTERS
+# MEME SCANNER FILTERS
 # =========================================================
 
 MIN_MARKET_CAP = 100_000
@@ -62,8 +61,42 @@ MIN_VOLUME_24H = 100_000
 MIN_VOLUME_1H = 2_500
 
 MIN_SCAN_SCORE = 35
-
 MAX_TOKEN_AGE_DAYS = 30
+
+
+# =========================================================
+# PAPER PERPS SETTINGS
+# =========================================================
+
+PERP_STARTING_BALANCE = 1000.00
+
+# USDC-style paper collateral per position
+PERP_COLLATERAL = 50.00
+
+# Start with 1x only
+PERP_LEVERAGE = 1.0
+
+PERP_ENTRY_SCORE = 60
+
+PERP_TAKE_PROFIT = 2.0
+PERP_STOP_LOSS = 1.0
+
+PERP_MAX_HOLD_MINUTES = 120
+PERP_MAX_OPEN_POSITIONS = 1
+
+# Simulated execution costs
+PERP_FEE_RATE = 0.0005
+PERP_SLIPPAGE_RATE = 0.0005
+
+PERP_ASSETS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana",
+}
+
+perp_balance = PERP_STARTING_BALANCE
+perp_positions = {}
+perp_history = []
 
 
 # =========================================================
@@ -92,6 +125,7 @@ def get_coin(coin):
     params = {
         "vs_currency": "usd",
         "ids": coin.lower(),
+        "price_change_percentage": "1h,24h",
     }
 
     data = get_json(url, params=params)
@@ -102,8 +136,70 @@ def get_coin(coin):
     return data[0]
 
 
+def get_perp_markets():
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+
+    ids = ",".join(PERP_ASSETS.values())
+
+    params = {
+        "vs_currency": "usd",
+        "ids": ids,
+        "price_change_percentage": "1h,24h",
+    }
+
+    data = get_json(url, params=params)
+
+    markets = {}
+
+    for item in data:
+        symbol = item.get("symbol", "").upper()
+
+        markets[symbol] = {
+            "id": item["id"],
+            "symbol": symbol,
+            "name": item["name"],
+            "price": float(item.get("current_price") or 0),
+            "market_cap": item.get("market_cap") or 0,
+            "volume_24h": item.get("total_volume") or 0,
+            "change_1h": (
+                item.get(
+                    "price_change_percentage_1h_in_currency"
+                )
+                or 0
+            ),
+            "change_24h": (
+                item.get(
+                    "price_change_percentage_24h_in_currency"
+                )
+                or item.get("price_change_percentage_24h")
+                or 0
+            ),
+        }
+
+    return markets
+
+
+def get_perp_price(symbol):
+    coin_id = PERP_ASSETS.get(symbol)
+
+    if not coin_id:
+        return None
+
+    data = get_coin(coin_id)
+
+    if not data:
+        return None
+
+    price = data.get("current_price")
+
+    if price is None:
+        return None
+
+    return float(price)
+
+
 # =========================================================
-# DEXSCREENER DISCOVERY
+# DEXSCREENER SOLANA DISCOVERY
 # =========================================================
 
 def collect_solana_token_addresses():
@@ -120,9 +216,8 @@ def collect_solana_token_addresses():
     for url in endpoints:
         try:
             items = get_json(url)
-
         except requests.RequestException as error:
-            print("Discovery feed error:", repr(error))
+            print("Discovery error:", repr(error))
             continue
 
         if not isinstance(items, list):
@@ -134,10 +229,7 @@ def collect_solana_token_addresses():
 
             address = item.get("tokenAddress")
 
-            if not address:
-                continue
-
-            if address in seen:
+            if not address or address in seen:
                 continue
 
             seen.add(address)
@@ -169,9 +261,8 @@ def get_solana_candidates():
 
         try:
             pairs = get_json(url)
-
         except requests.RequestException as error:
-            print("Pair lookup error:", repr(error))
+            print("DEX pair error:", repr(error))
             continue
 
         if isinstance(pairs, list):
@@ -194,51 +285,48 @@ def get_solana_candidates():
             or 0
         )
 
-        existing = best_pairs.get(address)
+        current = best_pairs.get(address)
 
-        if existing is None:
+        if current is None:
             best_pairs[address] = pair
             continue
 
-        existing_liquidity = (
-            (existing.get("liquidity") or {}).get("usd")
+        current_liquidity = (
+            (current.get("liquidity") or {}).get("usd")
             or 0
         )
 
-        if liquidity > existing_liquidity:
+        if liquidity > current_liquidity:
             best_pairs[address] = pair
 
     candidates = []
+
     now_ms = int(time.time() * 1000)
 
     for address, pair in best_pairs.items():
         base = pair.get("baseToken") or {}
-
         volume = pair.get("volume") or {}
         txns = pair.get("txns") or {}
         change = pair.get("priceChange") or {}
 
-        txns_1h = txns.get("h1") or {}
-        txns_6h = txns.get("h6") or {}
+        tx1 = txns.get("h1") or {}
 
-        pair_created_at = pair.get("pairCreatedAt")
+        created = pair.get("pairCreatedAt")
 
         age_hours = None
 
-        if pair_created_at:
+        if created:
             try:
                 age_hours = max(
                     0,
-                    now_ms - int(pair_created_at),
+                    now_ms - int(created),
                 ) / 3_600_000
-
-            except (TypeError, ValueError):
-                age_hours = None
+            except Exception:
+                pass
 
         try:
             price = float(pair.get("priceUsd") or 0)
-
-        except (TypeError, ValueError):
+        except Exception:
             price = 0
 
         candidates.append(
@@ -247,44 +335,27 @@ def get_solana_candidates():
                 "symbol": base.get("symbol") or "?",
                 "address": address,
                 "price": price,
-
                 "market_cap": (
                     pair.get("marketCap")
                     or pair.get("fdv")
                     or 0
                 ),
-
                 "liquidity": (
                     (pair.get("liquidity") or {}).get("usd")
                     or 0
                 ),
-
                 "volume_24h": volume.get("h24") or 0,
-                "volume_6h": volume.get("h6") or 0,
                 "volume_1h": volume.get("h1") or 0,
-
-                "buys_1h": txns_1h.get("buys") or 0,
-                "sells_1h": txns_1h.get("sells") or 0,
-
-                "buys_6h": txns_6h.get("buys") or 0,
-                "sells_6h": txns_6h.get("sells") or 0,
-
+                "buys_1h": tx1.get("buys") or 0,
+                "sells_1h": tx1.get("sells") or 0,
                 "price_change_1h": change.get("h1") or 0,
-                "price_change_6h": change.get("h6") or 0,
                 "price_change_24h": change.get("h24") or 0,
-
                 "age_hours": age_hours,
-                "dex_id": pair.get("dexId") or "",
-                "pair_url": pair.get("url") or "",
             }
         )
 
     return candidates
 
-
-# =========================================================
-# CURRENT TOKEN PRICE
-# =========================================================
 
 def get_token_price(address):
     url = (
@@ -294,10 +365,7 @@ def get_token_price(address):
 
     pairs = get_json(url)
 
-    if not isinstance(pairs, list):
-        return None
-
-    if not pairs:
+    if not isinstance(pairs, list) or not pairs:
         return None
 
     pair = max(
@@ -310,263 +378,134 @@ def get_token_price(address):
 
     try:
         return float(pair.get("priceUsd") or 0)
-
-    except (TypeError, ValueError):
+    except Exception:
         return None
 
 
 # =========================================================
-# SCORING
+# MEME SCORING
 # =========================================================
 
-def score_candidate(c):
+def score_meme(c):
     score = 0
     positives = []
     risks = []
 
     mc = c["market_cap"]
     liq = c["liquidity"]
-
     vol24 = c["volume_24h"]
     vol1 = c["volume_1h"]
 
-    buys1 = c["buys_1h"]
-    sells1 = c["sells_1h"]
+    buys = c["buys_1h"]
+    sells = c["sells_1h"]
 
     change1 = c["price_change_1h"]
-    change6 = c["price_change_6h"]
     change24 = c["price_change_24h"]
 
     age = c["age_hours"]
-
-
-    # -----------------------------------------------------
-    # AGE
-    # -----------------------------------------------------
 
     if age is not None:
         if age < 1:
             score -= 8
             risks.append("extremely new")
-
         elif age <= 72:
             score += 8
             positives.append("early-stage")
 
-        elif age <= 14 * 24:
-            score += 4
-
-
-    # -----------------------------------------------------
-    # MARKET CAP
-    # -----------------------------------------------------
-
     if 500_000 <= mc <= 10_000_000:
         score += 20
-        positives.append("good market-cap zone")
-
+        positives.append("good market cap")
     elif 100_000 <= mc <= 50_000_000:
         score += 10
 
-    else:
-        risks.append("market cap outside target")
-
-
-    # -----------------------------------------------------
-    # LIQUIDITY
-    # -----------------------------------------------------
-
     if liq >= 1_000_000:
         score += 20
-        positives.append("strong liquidity")
-
     elif liq >= 500_000:
         score += 16
-
     elif liq >= 250_000:
         score += 12
-
     elif liq >= 100_000:
         score += 8
-
     elif liq >= 25_000:
         score += 4
 
-    else:
-        risks.append("low liquidity")
-
-
-    # -----------------------------------------------------
-    # 24H VOLUME
-    # -----------------------------------------------------
-
-    if vol24 >= 10_000_000:
-        score += 15
-
-    elif vol24 >= 5_000_000:
+    if vol24 >= 5_000_000:
         score += 12
-
     elif vol24 >= 1_000_000:
         score += 9
-
     elif vol24 >= 100_000:
         score += 5
 
-
-    # -----------------------------------------------------
-    # VOLUME ACCELERATION
-    # -----------------------------------------------------
-
     expected_hourly = vol24 / 24 if vol24 else 0
 
-    if expected_hourly > 0:
+    if expected_hourly:
         acceleration = vol1 / expected_hourly
 
         if acceleration >= 4:
             score += 18
-            positives.append("strong volume acceleration")
-
+            positives.append("strong acceleration")
         elif acceleration >= 2:
             score += 13
-            positives.append("volume accelerating")
-
         elif acceleration >= 1.2:
             score += 7
 
-        elif acceleration < 0.35:
-            score -= 5
-            risks.append("volume fading")
-
-
-    # -----------------------------------------------------
-    # BUY PRESSURE
-    # -----------------------------------------------------
-
-    trades1 = buys1 + sells1
-
-    if trades1 >= 10:
-        if sells1 == 0:
+    if buys + sells >= 10:
+        if sells == 0:
             score += 12
-            positives.append("strong buy pressure")
-
         else:
-            ratio = buys1 / sells1
+            ratio = buys / sells
 
             if ratio >= 2:
                 score += 14
-                positives.append("strong buy pressure")
-
             elif ratio >= 1.4:
                 score += 10
-
             elif ratio >= 1.1:
                 score += 5
-
-            elif ratio < 0.70:
+            elif ratio < 0.7:
                 score -= 8
                 risks.append("selling pressure")
 
-
-    # -----------------------------------------------------
-    # SHORT-TERM PRICE ACTION
-    # -----------------------------------------------------
-
     if 1 <= change1 <= 15:
         score += 10
-        positives.append("healthy momentum")
-
     elif 15 < change1 <= 30:
         score += 5
-
     elif change1 > 60:
         score -= 20
-        risks.append("extreme 1h pump")
-
-    elif change1 > 35:
-        score -= 10
-        risks.append("price extended")
-
+        risks.append("extreme pump")
     elif change1 < -20:
         score -= 15
         risks.append("sharp decline")
 
-    elif change1 < -10:
-        score -= 6
-        risks.append("weak momentum")
-
-
-    # -----------------------------------------------------
-    # BIGGER TIMEFRAME EXTREMES
-    # -----------------------------------------------------
-
-    if change6 > 120:
-        score -= 10
-        risks.append("extreme 6h pump")
-
     if change24 > 300:
         score -= 15
-        risks.append("extreme 24h pump")
-
-    if change24 < -60:
-        score -= 15
-        risks.append("major 24h decline")
-
-
-    # -----------------------------------------------------
-    # LIQUIDITY / VALUE
-    # -----------------------------------------------------
 
     if mc and liq:
-        liquidity_ratio = liq / mc
+        ratio = liq / mc
 
-        if liquidity_ratio >= 0.20:
+        if ratio >= 0.20:
             score += 8
-            positives.append("healthy liquidity ratio")
-
-        elif liquidity_ratio >= 0.08:
+        elif ratio >= 0.08:
             score += 4
-
-        elif liquidity_ratio < 0.02:
+        elif ratio < 0.02:
             score -= 12
-            risks.append("thin liquidity vs valuation")
-
 
     score = max(0, min(100, score))
 
-
-    if score >= 80:
-        label = "🔥 STRONG WATCH"
-
-    elif score >= 65:
-        label = "👀 WATCH"
-
-    elif score >= 35:
-        label = "⚠️ SPECULATIVE"
-
-    else:
-        label = "WEAK"
+    return score, positives, risks
 
 
-    return score, label, positives, risks
-
-
-# =========================================================
-# FILTER + RANK
-# =========================================================
-
-def get_ranked_candidates():
-    candidates = get_solana_candidates()
-
+def get_ranked_memes():
     results = []
 
-    for c in candidates:
+    for c in get_solana_candidates():
         if c["price"] <= 0:
             continue
 
-        if c["market_cap"] < MIN_MARKET_CAP:
-            continue
-
-        if c["market_cap"] > MAX_MARKET_CAP:
+        if not (
+            MIN_MARKET_CAP
+            <= c["market_cap"]
+            <= MAX_MARKET_CAP
+        ):
             continue
 
         if c["liquidity"] < MIN_LIQUIDITY:
@@ -582,25 +521,19 @@ def get_ranked_candidates():
             if c["age_hours"] > MAX_TOKEN_AGE_DAYS * 24:
                 continue
 
-        score, label, positives, risks = score_candidate(c)
+        score, positives, risks = score_meme(c)
 
         if score < MIN_SCAN_SCORE:
             continue
 
         c["score"] = score
-        c["label"] = label
         c["positives"] = positives
         c["risks"] = risks
 
         results.append(c)
 
-
     results.sort(
-        key=lambda c: (
-            c["score"],
-            c["volume_1h"],
-            c["liquidity"],
-        ),
+        key=lambda c: c["score"],
         reverse=True,
     )
 
@@ -608,340 +541,572 @@ def get_ranked_candidates():
 
 
 # =========================================================
-# PAPER BUY
+# MEME PAPER TRADING
 # =========================================================
 
-def paper_buy(candidate):
-    global paper_balance
+def meme_buy(candidate):
+    global meme_balance
 
-    if len(paper_positions) >= MAX_OPEN_POSITIONS:
+    if len(meme_positions) >= MEME_MAX_OPEN_POSITIONS:
         return None
 
-    if paper_balance < PAPER_TRADE_SIZE:
+    if meme_balance < MEME_TRADE_SIZE:
         return None
 
-    address = candidate["address"]
-
-    if address in paper_positions:
+    if candidate["address"] in meme_positions:
         return None
 
-    entry_price = candidate["price"]
-
-    if entry_price <= 0:
-        return None
-
-    quantity = PAPER_TRADE_SIZE / entry_price
+    quantity = MEME_TRADE_SIZE / candidate["price"]
 
     position = {
-        "address": address,
+        "address": candidate["address"],
         "name": candidate["name"],
         "symbol": candidate["symbol"],
-        "entry_price": entry_price,
+        "entry_price": candidate["price"],
         "quantity": quantity,
-        "cost": PAPER_TRADE_SIZE,
+        "cost": MEME_TRADE_SIZE,
         "score": candidate["score"],
         "opened_at": time.time(),
     }
 
-    paper_positions[address] = position
+    meme_positions[candidate["address"]] = position
 
-    paper_balance -= PAPER_TRADE_SIZE
+    meme_balance -= MEME_TRADE_SIZE
 
     return position
 
 
-# =========================================================
-# PAPER SELL
-# =========================================================
+def meme_sell(address, price, reason):
+    global meme_balance
 
-def paper_sell(address, current_price, reason):
-    global paper_balance
-
-    position = paper_positions.get(address)
+    position = meme_positions.get(address)
 
     if not position:
         return None
 
-    proceeds = (
-        position["quantity"]
-        * current_price
-    )
+    proceeds = position["quantity"] * price
 
     pnl = proceeds - position["cost"]
 
-    pnl_percent = (
-        pnl / position["cost"]
-    ) * 100
+    pnl_pct = pnl / position["cost"] * 100
 
-    paper_balance += proceeds
+    meme_balance += proceeds
 
     trade = {
         **position,
-        "exit_price": current_price,
-        "proceeds": proceeds,
+        "exit_price": price,
         "pnl": pnl,
-        "pnl_percent": pnl_percent,
+        "pnl_pct": pnl_pct,
         "reason": reason,
-        "closed_at": time.time(),
     }
 
-    paper_trade_history.append(trade)
+    meme_history.append(trade)
 
-    del paper_positions[address]
+    del meme_positions[address]
 
     return trade
 
 
 # =========================================================
-# PAPER POSITION MONITOR
+# PERP SIGNAL ENGINE
 # =========================================================
 
-async def monitor_paper_positions(
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not paper_positions:
-        return
+def score_perp_market(market):
+    long_score = 0
+    short_score = 0
 
-    chat_id = context.job.chat_id
+    change1 = market["change_1h"]
+    change24 = market["change_24h"]
 
-    for address in list(paper_positions.keys()):
-        position = paper_positions.get(address)
+    market_cap = market["market_cap"]
+    volume = market["volume_24h"]
 
-        if not position:
-            continue
+    volume_ratio = (
+        volume / market_cap
+        if market_cap
+        else 0
+    )
 
-        try:
-            current_price = get_token_price(address)
+    # Liquidity/activity quality
+    if volume_ratio >= 0.05:
+        long_score += 10
+        short_score += 10
 
-        except Exception as error:
-            print(
-                "Paper monitor price error:",
-                repr(error),
-            )
-            continue
+    # LONG momentum
+    if 0.4 <= change1 <= 4:
+        long_score += 35
+    elif change1 > 4:
+        long_score += 15
 
-        if not current_price:
-            continue
+    if 0.5 <= change24 <= 12:
+        long_score += 30
+    elif change24 > 12:
+        long_score += 10
 
-        entry = position["entry_price"]
+    if change1 > 0 and change24 > 0:
+        long_score += 20
 
-        pnl_percent = (
-            (current_price - entry)
-            / entry
-        ) * 100
+    # SHORT momentum
+    if -4 <= change1 <= -0.4:
+        short_score += 35
+    elif change1 < -4:
+        short_score += 15
 
-        age_minutes = (
-            time.time()
-            - position["opened_at"]
-        ) / 60
+    if -12 <= change24 <= -0.5:
+        short_score += 30
+    elif change24 < -12:
+        short_score += 10
 
-        exit_reason = None
+    if change1 < 0 and change24 < 0:
+        short_score += 20
 
-        if pnl_percent >= TAKE_PROFIT_PERCENT:
-            exit_reason = "TAKE PROFIT"
+    # Avoid chasing extreme moves
+    if abs(change1) > 8:
+        long_score -= 20
+        short_score -= 20
 
-        elif pnl_percent <= -STOP_LOSS_PERCENT:
-            exit_reason = "STOP LOSS"
+    if abs(change24) > 20:
+        long_score -= 15
+        short_score -= 15
 
-        elif age_minutes >= MAX_HOLD_MINUTES:
-            exit_reason = "MAX HOLD TIME"
+    long_score = max(
+        0,
+        min(100, long_score),
+    )
 
-        if not exit_reason:
-            continue
+    short_score = max(
+        0,
+        min(100, short_score),
+    )
 
-        trade = paper_sell(
-            address,
-            current_price,
-            exit_reason,
+    if long_score > short_score:
+        return "LONG", long_score
+
+    if short_score > long_score:
+        return "SHORT", short_score
+
+    return "NONE", 0
+
+
+def get_perp_signals():
+    markets = get_perp_markets()
+
+    signals = []
+
+    for symbol, market in markets.items():
+        side, score = score_perp_market(market)
+
+        market["side"] = side
+        market["score"] = score
+
+        signals.append(market)
+
+    signals.sort(
+        key=lambda x: x["score"],
+        reverse=True,
+    )
+
+    return signals
+
+
+# =========================================================
+# PAPER PERP OPEN
+# =========================================================
+
+def open_perp_position(signal):
+    global perp_balance
+
+    if len(perp_positions) >= PERP_MAX_OPEN_POSITIONS:
+        return None
+
+    if perp_balance < PERP_COLLATERAL:
+        return None
+
+    symbol = signal["symbol"]
+
+    if symbol in perp_positions:
+        return None
+
+    market_price = signal["price"]
+
+    if market_price <= 0:
+        return None
+
+    side = signal["side"]
+
+    notional = (
+        PERP_COLLATERAL
+        * PERP_LEVERAGE
+    )
+
+    entry_fee = (
+        notional
+        * PERP_FEE_RATE
+    )
+
+    if side == "LONG":
+        entry_price = (
+            market_price
+            * (1 + PERP_SLIPPAGE_RATE)
+        )
+    else:
+        entry_price = (
+            market_price
+            * (1 - PERP_SLIPPAGE_RATE)
         )
 
-        if trade and chat_id:
+    if perp_balance < (
+        PERP_COLLATERAL + entry_fee
+    ):
+        return None
+
+    perp_balance -= (
+        PERP_COLLATERAL
+        + entry_fee
+    )
+
+    position = {
+        "symbol": symbol,
+        "name": signal["name"],
+        "side": side,
+        "score": signal["score"],
+        "entry_price": entry_price,
+        "collateral": PERP_COLLATERAL,
+        "notional": notional,
+        "entry_fee": entry_fee,
+        "opened_at": time.time(),
+    }
+
+    perp_positions[symbol] = position
+
+    return position
+
+
+# =========================================================
+# PAPER PERP CLOSE
+# =========================================================
+
+def close_perp_position(
+    symbol,
+    market_price,
+    reason,
+):
+    global perp_balance
+
+    position = perp_positions.get(symbol)
+
+    if not position:
+        return None
+
+    if position["side"] == "LONG":
+        exit_price = (
+            market_price
+            * (1 - PERP_SLIPPAGE_RATE)
+        )
+
+        return_pct = (
+            exit_price
+            - position["entry_price"]
+        ) / position["entry_price"]
+
+    else:
+        exit_price = (
+            market_price
+            * (1 + PERP_SLIPPAGE_RATE)
+        )
+
+        return_pct = (
+            position["entry_price"]
+            - exit_price
+        ) / position["entry_price"]
+
+    gross_pnl = (
+        return_pct
+        * position["notional"]
+    )
+
+    exit_fee = (
+        position["notional"]
+        * PERP_FEE_RATE
+    )
+
+    net_pnl = (
+        gross_pnl
+        - exit_fee
+    )
+
+    perp_balance += (
+        position["collateral"]
+        + net_pnl
+    )
+
+    pnl_pct = (
+        net_pnl
+        / position["collateral"]
+    ) * 100
+
+    trade = {
+        **position,
+        "exit_price": exit_price,
+        "gross_pnl": gross_pnl,
+        "exit_fee": exit_fee,
+        "net_pnl": net_pnl,
+        "pnl_pct": pnl_pct,
+        "reason": reason,
+        "closed_at": time.time(),
+    }
+
+    perp_history.append(trade)
+
+    del perp_positions[symbol]
+
+    return trade
+
+
+# =========================================================
+# POSITION MONITOR
+# =========================================================
+
+async def monitor_positions(
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    chat_id = context.job.chat_id
+
+    # ---------------- MEMES ----------------
+
+    for address in list(meme_positions.keys()):
+        p = meme_positions.get(address)
+
+        try:
+            current = get_token_price(address)
+        except Exception:
+            continue
+
+        if not current:
+            continue
+
+        pnl_pct = (
+            (current - p["entry_price"])
+            / p["entry_price"]
+        ) * 100
+
+        minutes = (
+            time.time()
+            - p["opened_at"]
+        ) / 60
+
+        reason = None
+
+        if pnl_pct >= MEME_TAKE_PROFIT:
+            reason = "TAKE PROFIT"
+
+        elif pnl_pct <= -MEME_STOP_LOSS:
+            reason = "STOP LOSS"
+
+        elif minutes >= MEME_MAX_HOLD_MINUTES:
+            reason = "MAX HOLD"
+
+        if reason:
+            trade = meme_sell(
+                address,
+                current,
+                reason,
+            )
+
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    "📤 PAPER SELL\n\n"
-                    f"{trade['name']} "
-                    f"({trade['symbol']})\n\n"
+                    "📤 MEME PAPER SELL\n\n"
+                    f"{trade['symbol']}\n"
                     f"Reason: {trade['reason']}\n"
-                    f"Entry: ${trade['entry_price']:.10f}\n"
-                    f"Exit: ${trade['exit_price']:.10f}\n"
-                    f"P/L: ${trade['pnl']:+.2f}\n"
-                    f"P/L %: {trade['pnl_percent']:+.2f}%\n\n"
-                    f"Paper cash: ${paper_balance:.2f}"
+                    f"P/L: {trade['pnl_pct']:+.2f}%\n"
+                    f"Cash: ${meme_balance:.2f}"
+                ),
+            )
+
+    # ---------------- PERPS ----------------
+
+    for symbol in list(perp_positions.keys()):
+        p = perp_positions.get(symbol)
+
+        try:
+            current = get_perp_price(symbol)
+        except Exception:
+            continue
+
+        if not current:
+            continue
+
+        if p["side"] == "LONG":
+            raw_pct = (
+                current - p["entry_price"]
+            ) / p["entry_price"] * 100
+        else:
+            raw_pct = (
+                p["entry_price"] - current
+            ) / p["entry_price"] * 100
+
+        leveraged_pct = (
+            raw_pct
+            * PERP_LEVERAGE
+        )
+
+        minutes = (
+            time.time()
+            - p["opened_at"]
+        ) / 60
+
+        reason = None
+
+        if leveraged_pct >= PERP_TAKE_PROFIT:
+            reason = "TAKE PROFIT"
+
+        elif leveraged_pct <= -PERP_STOP_LOSS:
+            reason = "STOP LOSS"
+
+        elif minutes >= PERP_MAX_HOLD_MINUTES:
+            reason = "MAX HOLD"
+
+        if reason:
+            trade = close_perp_position(
+                symbol,
+                current,
+                reason,
+            )
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "📤 PERP PAPER CLOSE\n\n"
+                    f"{trade['symbol']} "
+                    f"{trade['side']}\n"
+                    f"Reason: {trade['reason']}\n"
+                    f"Net P/L: "
+                    f"${trade['net_pnl']:+.2f}\n"
+                    f"P/L: "
+                    f"{trade['pnl_pct']:+.2f}%\n"
+                    f"Perp balance: "
+                    f"${perp_balance:.2f} USDC"
                 ),
             )
 
 
 # =========================================================
-# BUILD HUNT MESSAGE
+# AUTO MEME SCAN
 # =========================================================
 
-def build_hunt_message(results):
-    top = results[:5]
-
-    if not top:
-        return (
-            "🔎 JARVIS SOLANA HUNT\n\n"
-            "No tokens currently meet "
-            "Jarvis's loose paper-test filters."
-        )
-
-    lines = [
-        "🚨 JARVIS SOLANA HUNT",
-        "",
-        "🧪 LOOSE PAPER TEST MODE",
-        "",
-    ]
-
-    for i, c in enumerate(top, 1):
-        sells = c["sells_1h"]
-
-        if sells:
-            buy_pressure = c["buys_1h"] / sells
-            buy_pressure_text = f"{buy_pressure:.2f}x"
-
-        elif c["buys_1h"]:
-            buy_pressure_text = "buy-heavy"
-
-        else:
-            buy_pressure_text = "N/A"
-
-
-        if c["age_hours"] is None:
-            age_text = "Unknown"
-
-        elif c["age_hours"] < 24:
-            age_text = f"{c['age_hours']:.1f}h"
-
-        else:
-            age_text = (
-                f"{c['age_hours'] / 24:.1f}d"
-            )
-
-
-        strengths = (
-            ", ".join(c["positives"][:3])
-            if c["positives"]
-            else "none"
-        )
-
-        risks = (
-            ", ".join(c["risks"][:3])
-            if c["risks"]
-            else "none"
-        )
-
-
-        lines.extend(
-            [
-                f"{i}. {c['name']} ({c['symbol']})",
-                f"Score: {c['score']}/100",
-                f"Signal: {c['label']}",
-                f"Age: {age_text}",
-                f"Price: ${c['price']:.10f}",
-                f"Market cap: ${c['market_cap']:,.0f}",
-                f"Liquidity: ${c['liquidity']:,.0f}",
-                f"24h volume: ${c['volume_24h']:,.0f}",
-                f"1h volume: ${c['volume_1h']:,.0f}",
-                f"1h buy pressure: {buy_pressure_text}",
-                f"1h change: {c['price_change_1h']:.1f}%",
-                f"Strengths: {strengths}",
-                f"Flags: {risks}",
-                f"Token: {c['address']}",
-                "",
-            ]
-        )
-
-    return "\n".join(lines)[:4000]
-
-
-# =========================================================
-# PAPER ENTRY
-# =========================================================
-
-async def try_paper_entry(
-    context,
-    results,
-    chat_id,
-):
-    if paper_positions:
-        return
-
-    eligible = [
-        candidate
-        for candidate in results
-        if candidate["score"] >= PAPER_MIN_ENTRY_SCORE
-    ]
-
-    if not eligible:
-        return
-
-    candidate = eligible[0]
-
-    position = paper_buy(candidate)
-
-    if not position:
-        return
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "📥 PAPER BUY\n\n"
-            f"{position['name']} "
-            f"({position['symbol']})\n\n"
-            f"Jarvis score: "
-            f"{position['score']}/100\n"
-            f"Entry: "
-            f"${position['entry_price']:.10f}\n"
-            f"Paper size: "
-            f"${position['cost']:.2f}\n\n"
-            f"Take profit: "
-            f"+{TAKE_PROFIT_PERCENT:.1f}%\n"
-            f"Stop loss: "
-            f"-{STOP_LOSS_PERCENT:.1f}%\n"
-            f"Max hold: "
-            f"{MAX_HOLD_MINUTES} minutes\n\n"
-            f"Cash remaining: "
-            f"${paper_balance:.2f}"
-        ),
-    )
-
-
-# =========================================================
-# AUTOMATIC HUNT
-# =========================================================
-
-async def auto_hunt(
+async def auto_meme_scan(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     chat_id = context.job.chat_id
 
-    if chat_id is None:
-        return
-
     try:
-        results = get_ranked_candidates()
+        results = get_ranked_memes()
 
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=build_hunt_message(results),
+        if not results:
+            return
+
+        if meme_positions:
+            return
+
+        eligible = [
+            c
+            for c in results
+            if c["score"] >= MEME_ENTRY_SCORE
+        ]
+
+        if not eligible:
+            return
+
+        position = meme_buy(
+            eligible[0]
         )
 
-        await try_paper_entry(
-            context,
-            results,
-            chat_id,
-        )
+        if position:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "📥 MEME PAPER BUY\n\n"
+                    f"{position['name']} "
+                    f"({position['symbol']})\n"
+                    f"Score: {position['score']}/100\n"
+                    f"Size: ${position['cost']:.2f}\n"
+                    f"Entry: "
+                    f"${position['entry_price']:.10f}"
+                ),
+            )
 
     except Exception as error:
         print(
-            "Auto hunt error:",
+            "Auto meme error:",
             repr(error),
         )
 
 
 # =========================================================
-# /START
+# AUTO PERP SCAN
+# =========================================================
+
+async def auto_perp_scan(
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    chat_id = context.job.chat_id
+
+    if perp_positions:
+        return
+
+    try:
+        signals = get_perp_signals()
+
+        eligible = [
+            s
+            for s in signals
+            if (
+                s["side"] != "NONE"
+                and s["score"] >= PERP_ENTRY_SCORE
+            )
+        ]
+
+        if not eligible:
+            return
+
+        signal = eligible[0]
+
+        position = open_perp_position(
+            signal
+        )
+
+        if position:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "📥 PERP PAPER OPEN\n\n"
+                    f"{position['symbol']} "
+                    f"{position['side']}\n"
+                    f"Signal score: "
+                    f"{position['score']}/100\n"
+                    f"Entry: "
+                    f"${position['entry_price']:,.4f}\n"
+                    f"Collateral: "
+                    f"${position['collateral']:.2f} USDC\n"
+                    f"Leverage: "
+                    f"{PERP_LEVERAGE:.1f}x\n"
+                    f"Take profit: "
+                    f"+{PERP_TAKE_PROFIT:.1f}%\n"
+                    f"Stop loss: "
+                    f"-{PERP_STOP_LOSS:.1f}%"
+                ),
+            )
+
+    except Exception as error:
+        print(
+            "Auto perp error:",
+            repr(error),
+        )
+
+
+# =========================================================
+# TELEGRAM COMMANDS
 # =========================================================
 
 async def start(
@@ -951,187 +1116,197 @@ async def start(
     chat_id = update.effective_chat.id
 
     await update.message.reply_text(
-        "🤖 Crypto Jarvis PAPER SCALPER online.\n\n"
-        "Commands:\n"
+        "🤖 CALTANIDE JARVIS PAPER TRADER\n\n"
+        "Meme commands:\n"
         "/hunt\n"
         "/paper\n"
-        "/positions\n"
-        "/history\n"
+        "/positions\n\n"
+        "Perp commands:\n"
+        "/perpscan\n"
+        "/perpaccount\n"
+        "/perppositions\n"
+        "/perphistory\n\n"
+        "Other:\n"
         "/price bitcoin\n"
         "/analyse bitcoin"
     )
 
-    hunt_name = f"auto_hunt_{chat_id}"
-    monitor_name = f"paper_monitor_{chat_id}"
+    jobs = [
+        (
+            auto_meme_scan,
+            "auto_meme",
+            AUTO_HUNT_INTERVAL,
+            60,
+        ),
+        (
+            auto_perp_scan,
+            "auto_perp",
+            AUTO_HUNT_INTERVAL,
+            90,
+        ),
+        (
+            monitor_positions,
+            "position_monitor",
+            POSITION_MONITOR_INTERVAL,
+            30,
+        ),
+    ]
 
-    if not context.job_queue.get_jobs_by_name(
-        hunt_name
-    ):
-        context.job_queue.run_repeating(
-            auto_hunt,
-            interval=AUTO_HUNT_INTERVAL,
-            first=AUTO_HUNT_FIRST_SCAN,
-            chat_id=chat_id,
-            name=hunt_name,
-        )
+    for callback, prefix, interval, first in jobs:
+        name = f"{prefix}_{chat_id}"
 
-    if not context.job_queue.get_jobs_by_name(
-        monitor_name
-    ):
-        context.job_queue.run_repeating(
-            monitor_paper_positions,
-            interval=PAPER_MONITOR_INTERVAL,
-            first=PAPER_MONITOR_INTERVAL,
-            chat_id=chat_id,
-            name=monitor_name,
-        )
+        if not context.job_queue.get_jobs_by_name(name):
+            context.job_queue.run_repeating(
+                callback,
+                interval=interval,
+                first=first,
+                chat_id=chat_id,
+                name=name,
+            )
 
     await update.message.reply_text(
-        "✅ Loose paper-test mode activated.\n"
-        f"Entry threshold: {PAPER_MIN_ENTRY_SCORE}/100\n"
-        "No real money will be used."
+        "✅ Automatic PAPER trading active.\n"
+        "Meme scalping + BTC/ETH/SOL long/short.\n"
+        "Perps use simulated USDC at 1x leverage.\n"
+        "No real money is being used."
     )
 
 
-# =========================================================
-# /PAPER
-# =========================================================
+async def hunt(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        "🔎 Scanning Solana..."
+    )
+
+    try:
+        results = get_ranked_memes()
+
+        if not results:
+            await update.message.reply_text(
+                "No meme candidates currently pass the filter."
+            )
+            return
+
+        lines = [
+            "🚨 SOLANA PAPER HUNT",
+            "",
+        ]
+
+        for c in results[:5]:
+            lines.extend(
+                [
+                    f"{c['name']} ({c['symbol']})",
+                    f"Score: {c['score']}/100",
+                    f"Market cap: ${c['market_cap']:,.0f}",
+                    f"Liquidity: ${c['liquidity']:,.0f}",
+                    f"1h volume: ${c['volume_1h']:,.0f}",
+                    "",
+                ]
+            )
+
+        await update.message.reply_text(
+            "\n".join(lines)[:4000]
+        )
+
+    except Exception as error:
+        print("Hunt:", repr(error))
+
+        await update.message.reply_text(
+            "Meme scan unavailable."
+        )
+
+
+async def perpscan(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    try:
+        signals = get_perp_signals()
+
+        lines = [
+            "📈 PAPER PERP SCANNER",
+            "",
+            "Collateral currency: simulated USDC",
+            f"Leverage: {PERP_LEVERAGE:.1f}x",
+            "",
+        ]
+
+        for s in signals:
+            lines.extend(
+                [
+                    f"{s['symbol']} — {s['side']}",
+                    f"Score: {s['score']}/100",
+                    f"Price: ${s['price']:,.4f}",
+                    f"1h: {s['change_1h']:+.2f}%",
+                    f"24h: {s['change_24h']:+.2f}%",
+                    "",
+                ]
+            )
+
+        await update.message.reply_text(
+            "\n".join(lines)
+        )
+
+    except Exception as error:
+        print("Perp scan:", repr(error))
+
+        await update.message.reply_text(
+            "Perp scan unavailable."
+        )
+
 
 async def paper(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    realized_pnl = sum(
-        trade["pnl"]
-        for trade in paper_trade_history
+    pnl = sum(
+        t["pnl"]
+        for t in meme_history
     )
-
-    account_value = paper_balance
-
-    for position in paper_positions.values():
-        try:
-            current_price = get_token_price(
-                position["address"]
-            )
-
-            if current_price:
-                account_value += (
-                    position["quantity"]
-                    * current_price
-                )
-
-        except Exception:
-            account_value += position["cost"]
 
     await update.message.reply_text(
-        "💵 PAPER ACCOUNT\n\n"
-        f"Cash: ${paper_balance:.2f}\n"
-        f"Account value: ${account_value:.2f}\n"
-        f"Open positions: {len(paper_positions)}\n"
-        f"Closed trades: {len(paper_trade_history)}\n"
-        f"Realized P/L: ${realized_pnl:+.2f}"
+        "💵 MEME PAPER ACCOUNT\n\n"
+        f"Cash: ${meme_balance:.2f}\n"
+        f"Open positions: {len(meme_positions)}\n"
+        f"Closed trades: {len(meme_history)}\n"
+        f"Realized P/L: ${pnl:+.2f}"
     )
 
-
-# =========================================================
-# /POSITIONS
-# =========================================================
 
 async def positions(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not paper_positions:
+    if not meme_positions:
         await update.message.reply_text(
-            "No paper positions are open."
+            "No meme paper positions open."
         )
         return
 
     lines = [
-        "📊 OPEN PAPER POSITIONS",
+        "📊 MEME PAPER POSITIONS",
         "",
     ]
 
-    for position in paper_positions.values():
-        try:
-            current_price = get_token_price(
-                position["address"]
-            )
+    for p in meme_positions.values():
+        current = get_token_price(
+            p["address"]
+        )
 
-        except Exception:
-            current_price = None
-
-
-        if current_price:
-            pnl_percent = (
-                (current_price - position["entry_price"])
-                / position["entry_price"]
-            ) * 100
-
-            current_value = (
-                current_price
-                * position["quantity"]
-            )
-
+        if current:
+            pnl = (
+                current - p["entry_price"]
+            ) / p["entry_price"] * 100
         else:
-            pnl_percent = 0
-            current_value = position["cost"]
-
-
-        minutes_open = (
-            time.time()
-            - position["opened_at"]
-        ) / 60
-
+            pnl = 0
 
         lines.extend(
             [
-                f"{position['name']} "
-                f"({position['symbol']})",
-                f"Score: {position['score']}/100",
-                f"Entry: "
-                f"${position['entry_price']:.10f}",
-                f"Current value: "
-                f"${current_value:.2f}",
-                f"P/L: {pnl_percent:+.2f}%",
-                f"Open: {minutes_open:.0f} min",
-                "",
-            ]
-        )
-
-
-    await update.message.reply_text(
-        "\n".join(lines)[:4000]
-    )
-
-
-# =========================================================
-# /HISTORY
-# =========================================================
-
-async def history(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not paper_trade_history:
-        await update.message.reply_text(
-            "No completed paper trades yet."
-        )
-        return
-
-    lines = [
-        "📚 PAPER TRADE HISTORY",
-        "",
-    ]
-
-    for trade in paper_trade_history[-10:]:
-        lines.extend(
-            [
-                f"{trade['name']} "
-                f"({trade['symbol']})",
-                f"{trade['pnl_percent']:+.2f}%",
-                f"P/L: ${trade['pnl']:+.2f}",
-                f"Exit: {trade['reason']}",
+                f"{p['symbol']}",
+                f"Entry: ${p['entry_price']:.10f}",
+                f"P/L: {pnl:+.2f}%",
                 "",
             ]
         )
@@ -1141,45 +1316,105 @@ async def history(
     )
 
 
-# =========================================================
-# /HUNT
-# =========================================================
-
-async def hunt(
+async def perpaccount(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    await update.message.reply_text(
-        "🔎 Jarvis is scanning..."
+    realized = sum(
+        t["net_pnl"]
+        for t in perp_history
     )
 
-    try:
-        results = get_ranked_candidates()
+    await update.message.reply_text(
+        "💵 PAPER PERP ACCOUNT\n\n"
+        f"USDC balance: ${perp_balance:.2f}\n"
+        f"Open positions: {len(perp_positions)}\n"
+        f"Closed trades: {len(perp_history)}\n"
+        f"Realized P/L: ${realized:+.2f}\n"
+        f"Leverage: {PERP_LEVERAGE:.1f}x"
+    )
 
+
+async def perppositions(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not perp_positions:
         await update.message.reply_text(
-            build_hunt_message(results)
+            "No paper perp positions open."
+        )
+        return
+
+    lines = [
+        "📊 OPEN PAPER PERPS",
+        "",
+    ]
+
+    for p in perp_positions.values():
+        current = get_perp_price(
+            p["symbol"]
         )
 
-        await try_paper_entry(
-            context,
-            results,
-            update.effective_chat.id,
+        if current:
+            if p["side"] == "LONG":
+                pnl = (
+                    current - p["entry_price"]
+                ) / p["entry_price"] * 100
+            else:
+                pnl = (
+                    p["entry_price"] - current
+                ) / p["entry_price"] * 100
+
+            pnl *= PERP_LEVERAGE
+
+        else:
+            pnl = 0
+
+        lines.extend(
+            [
+                f"{p['symbol']} {p['side']}",
+                f"Entry: ${p['entry_price']:,.4f}",
+                f"P/L: {pnl:+.2f}%",
+                f"Collateral: ${p['collateral']:.2f}",
+                "",
+            ]
         )
 
-    except Exception as error:
-        print(
-            "Manual hunt error:",
-            repr(error),
-        )
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
 
+
+async def perphistory(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not perp_history:
         await update.message.reply_text(
-            "Jarvis hunt encountered an error."
+            "No completed paper perp trades yet."
+        )
+        return
+
+    lines = [
+        "📚 PAPER PERP HISTORY",
+        "",
+    ]
+
+    for t in perp_history[-10:]:
+        lines.extend(
+            [
+                f"{t['symbol']} {t['side']}",
+                f"P/L: {t['pnl_pct']:+.2f}%",
+                f"${t['net_pnl']:+.2f}",
+                f"Exit: {t['reason']}",
+                "",
+            ]
         )
 
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
 
-# =========================================================
-# /PRICE
-# =========================================================
 
 async def price(
     update: Update,
@@ -1202,42 +1437,19 @@ async def price(
             )
             return
 
-        change = data.get(
-            "price_change_percentage_24h"
-        )
-
-        if change is None:
-            change_text = "N/A"
-
-        else:
-            change_text = f"{change:+.2f}%"
-
         await update.message.reply_text(
-            f"🪙 {data['name']} "
-            f"({data['symbol'].upper()})\n\n"
-            f"Price: "
-            f"${data['current_price']:,}\n"
-            f"24h: {change_text}\n"
-            f"Market cap: "
-            f"${data['market_cap']:,}\n"
-            f"24h volume: "
-            f"${data['total_volume']:,}"
+            f"🪙 {data['name']}\n\n"
+            f"Price: ${data['current_price']:,}\n"
+            f"24h: "
+            f"{data.get('price_change_percentage_24h') or 0:+.2f}%\n"
+            f"Market cap: ${data['market_cap']:,}"
         )
 
-    except Exception as error:
-        print(
-            "Price error:",
-            repr(error),
-        )
-
+    except Exception:
         await update.message.reply_text(
-            "Market data unavailable."
+            "Price unavailable."
         )
 
-
-# =========================================================
-# /ANALYSE
-# =========================================================
 
 async def analyse(
     update: Update,
@@ -1261,24 +1473,21 @@ async def analyse(
             return
 
         prompt = f"""
-You are Crypto Jarvis, a cautious cryptocurrency analyst.
+You are Crypto Jarvis.
+
+Analyze this cryptocurrency cautiously.
 
 Coin: {data['name']}
-Symbol: {data['symbol']}
-Price: ${data['current_price']}
-24h change: {data['price_change_percentage_24h']}
-Market cap: ${data['market_cap']}
-24h volume: ${data['total_volume']}
+Price: {data['current_price']}
+1h change: {data.get('price_change_percentage_1h_in_currency')}
+24h change: {data.get('price_change_percentage_24h_in_currency')}
+Market cap: {data['market_cap']}
+Volume: {data['total_volume']}
 
-Give a concise analysis covering:
-1. Momentum
-2. Volume
-3. Risk
-4. Bullish confirmation
-5. Invalidation
+Discuss momentum, risk, bullish confirmation,
+and bearish invalidation.
 
 Do not guarantee profits.
-Use only the supplied market data.
 """
 
         response = client.responses.create(
@@ -1291,19 +1500,14 @@ Use only the supplied market data.
             + response.output_text
         )
 
-    except Exception as error:
-        print(
-            "Analysis error:",
-            repr(error),
-        )
-
+    except Exception:
         await update.message.reply_text(
-            "Jarvis analysis unavailable."
+            "Analysis unavailable."
         )
 
 
 # =========================================================
-# RUN BOT
+# RUN
 # =========================================================
 
 def main():
@@ -1314,15 +1518,21 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+
     app.add_handler(CommandHandler("hunt", hunt))
     app.add_handler(CommandHandler("paper", paper))
     app.add_handler(CommandHandler("positions", positions))
-    app.add_handler(CommandHandler("history", history))
+
+    app.add_handler(CommandHandler("perpscan", perpscan))
+    app.add_handler(CommandHandler("perpaccount", perpaccount))
+    app.add_handler(CommandHandler("perppositions", perppositions))
+    app.add_handler(CommandHandler("perphistory", perphistory))
+
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("analyse", analyse))
 
     print(
-        "Crypto Jarvis loose PAPER scalper online"
+        "Caltanide Jarvis PAPER trader online"
     )
 
     app.run_polling()
