@@ -8,15 +8,24 @@ from zoneinfo import ZoneInfo
 
 
 # ============================================================
-# JARVIS CLASSIC FAST
-# BUILT TO RECREATE THE ACTIVE PAPER-TRADING STYLE
+# JARVIS CLASSIC FAST V3
+# LIVE SOLANA DATA + PAPER TRADING
+#
+# IMPORTANT:
+# - Keeps existing jarvis_classic_state.json
+# - /resetday resets 30/30 -> 0/30
+# - Keeps account balance
+# - Keeps total P/L
+# - Keeps wins/losses/history
+# - Does NOT close open positions
 # ============================================================
+
 
 SYDNEY = ZoneInfo("Australia/Sydney")
 
 DEX_BASE = "https://api.dexscreener.com"
 
-# New clean state for this version
+# SAME FILE AS YOUR CLASSIC VERSION
 STATE_FILE = "jarvis_classic_state.json"
 
 
@@ -28,28 +37,22 @@ CONFIG = {
 
     "starting_balance": 1000.00,
 
-    "daily_profit_target": 500.00,
-
     # --------------------------------------------------------
-    # ACTIVE POSITION SETTINGS
+    # FAST TRADING
     # --------------------------------------------------------
 
     "max_position_pct": 10.0,
-
     "max_open_positions": 3,
-
     "max_daily_entries": 30,
 
     # --------------------------------------------------------
-    # EXITS - CLASSIC SETTINGS
+    # EXITS
     # --------------------------------------------------------
 
     "stop_loss_pct": 8.0,
-
     "take_profit_pct": 18.0,
 
     "trailing_activation_pct": 8.0,
-
     "trailing_stop_pct": 6.0,
 
     # --------------------------------------------------------
@@ -63,43 +66,38 @@ CONFIG = {
     # --------------------------------------------------------
 
     "min_liquidity": 25000,
-
     "min_volume_24h": 50000,
 
     "min_market_cap": 40000,
-
     "max_market_cap": 5000000,
 
     "min_5m_change": 1.5,
-
     "max_5m_change": 35.0,
 
     "min_1h_change": -5.0,
-
     "max_1h_change": 120.0,
 
     "min_5m_buys": 5,
-
     "min_buy_pressure_pct": 50.0,
 
     "min_score": 62,
 
     "min_pair_age_minutes": 3,
-
     "max_pair_age_days": 30,
 
     # --------------------------------------------------------
-    # DISCOVERY / SPEED
+    # DISCOVERY
     # --------------------------------------------------------
 
     "max_discovered_tokens": 90,
-
     "batch_size": 30,
 
+    # --------------------------------------------------------
+    # SPEED
+    # --------------------------------------------------------
+
     "scan_every_seconds": 15,
-
     "price_update_seconds": 8,
-
     "status_every_seconds": 300,
 
     # --------------------------------------------------------
@@ -123,25 +121,19 @@ def today_key():
 
 
 def safe_float(value, default=0.0):
-
     try:
         if value is None:
             return default
-
         return float(value)
-
     except Exception:
         return default
 
 
 def safe_int(value, default=0):
-
     try:
         if value is None:
             return default
-
         return int(value)
-
     except Exception:
         return default
 
@@ -156,7 +148,7 @@ def http_json(
     try:
 
         headers = {
-            "User-Agent": "JarvisClassicPaperBot/1.0",
+            "User-Agent": "JarvisClassicFastV3/1.0",
             "Accept": "application/json"
         }
 
@@ -234,7 +226,6 @@ class TelegramManager:
             )
 
             self.delete_webhook()
-
             self.set_commands()
 
 
@@ -265,7 +256,8 @@ class TelegramManager:
         self.api(
             "deleteWebhook",
             {
-                "drop_pending_updates": "false"
+                "drop_pending_updates":
+                    "false"
             }
         )
 
@@ -281,7 +273,7 @@ class TelegramManager:
 
             {
                 "command": "today",
-                "description": "Today's P/L"
+                "description": "Today's paper session"
             },
 
             {
@@ -296,35 +288,46 @@ class TelegramManager:
 
             {
                 "command": "scan",
-                "description": "Scanner activity"
+                "description": "Scanner status"
+            },
+
+            {
+                "command": "resetday",
+                "description": "Reset session to 0/30"
             },
 
             {
                 "command": "pause",
-                "description": "Pause new trades"
+                "description": "Pause new entries"
             },
 
             {
                 "command": "resume",
-                "description": "Resume trading"
+                "description": "Resume new entries"
             },
 
             {
                 "command": "paper",
-                "description": "Show mode"
+                "description": "Show trading mode"
             },
 
             {
                 "command": "help",
-                "description": "Commands"
+                "description": "Show commands"
             }
         ])
 
-        self.api(
+        result = self.api(
             "setMyCommands",
             {
-                "commands": commands
+                "commands":
+                    commands
             }
+        )
+
+        print(
+            "setMyCommands:",
+            result
         )
 
 
@@ -342,8 +345,11 @@ class TelegramManager:
         self.api(
             "sendMessage",
             {
-                "chat_id": self.chat_id,
-                "text": message
+                "chat_id":
+                    self.chat_id,
+
+                "text":
+                    message
             }
         )
 
@@ -358,7 +364,6 @@ class TelegramManager:
         }
 
         if self.offset is not None:
-
             data["offset"] = self.offset
 
         result = self.api(
@@ -425,40 +430,62 @@ class TelegramManager:
             if incoming_chat_id != self.chat_id:
                 continue
 
+            if not text:
+                continue
+
             command = (
-                text.lower().split()[0]
-                if text
-                else ""
+                text
+                .lower()
+                .split()[0]
+            )
+
+            # Handles commands such as:
+            # /resetday@caltanide_bot
+
+            command = (
+                command
+                .split("@")[0]
             )
 
 
-            if command in [
-                "/start",
-                "start"
-            ]:
+            # =================================================
+            # START
+            # =================================================
+
+            if command == "/start":
 
                 self.send(
 
-                    "🤖 JARVIS CLASSIC FAST ONLINE\n\n"
+                    "🤖 JARVIS CLASSIC FAST V3 ONLINE\n\n"
 
                     "Market data: LIVE\n"
                     "Mode: PAPER TRADING\n\n"
 
-                    "Fast scanner enabled.\n"
-                    "Maximum 3 open trades.\n"
-                    "Maximum 30 entries/day.\n\n"
+                    "⚡ Fast scanning\n"
+                    "⚡ Up to 3 open trades\n"
+                    "⚡ 30 entries per session\n\n"
+
+                    "🔄 /resetday\n"
+                    "Starts another 30-trade "
+                    "paper session while keeping "
+                    "your account and history.\n\n"
 
                     "/status\n"
                     "/today\n"
                     "/positions\n"
                     "/trades\n"
                     "/scan\n"
+                    "/resetday\n"
                     "/pause\n"
                     "/resume\n"
                     "/paper\n"
                     "/help"
                 )
 
+
+            # =================================================
+            # STATUS
+            # =================================================
 
             elif command == "/status":
 
@@ -467,12 +494,20 @@ class TelegramManager:
                 )
 
 
+            # =================================================
+            # TODAY
+            # =================================================
+
             elif command == "/today":
 
                 self.send(
                     bot.today_message()
                 )
 
+
+            # =================================================
+            # POSITIONS
+            # =================================================
 
             elif command == "/positions":
 
@@ -483,12 +518,20 @@ class TelegramManager:
                 )
 
 
+            # =================================================
+            # TRADES
+            # =================================================
+
             elif command == "/trades":
 
                 self.send(
                     bot.trades_message()
                 )
 
+
+            # =================================================
+            # SCAN
+            # =================================================
 
             elif command == "/scan":
 
@@ -497,6 +540,84 @@ class TelegramManager:
                 )
 
 
+            # =================================================
+            # RESET DAY
+            # =================================================
+
+            elif command == "/resetday":
+
+                old_entries = (
+                    bot.daily_entries
+                )
+
+                old_session_profit = (
+                    bot.daily_profit
+                )
+
+                equity = (
+                    bot.get_equity()
+                )
+
+                total_profit = (
+                    bot.total_profit()
+                )
+
+                wins = (
+                    bot.total_wins
+                )
+
+                losses = (
+                    bot.total_losses
+                )
+
+                open_positions = (
+                    len(bot.positions)
+                )
+
+                bot.manual_reset_day()
+
+                self.send(
+
+                    "🔄 JARVIS PAPER SESSION RESET\n\n"
+
+                    f"Previous session trades: "
+                    f"{old_entries}/"
+                    f"{CONFIG['max_daily_entries']}\n"
+
+                    f"Previous session P/L: "
+                    f"${old_session_profit:+.2f}\n\n"
+
+                    "NEW SESSION\n"
+
+                    f"Trades: "
+                    f"0/"
+                    f"{CONFIG['max_daily_entries']}\n"
+
+                    "Session P/L: $+0.00\n\n"
+
+                    f"Equity kept: "
+                    f"${equity:,.2f}\n"
+
+                    f"Total P/L kept: "
+                    f"${total_profit:+,.2f}\n"
+
+                    f"Wins kept: "
+                    f"{wins}\n"
+
+                    f"Losses kept: "
+                    f"{losses}\n"
+
+                    f"Open positions kept: "
+                    f"{open_positions}\n\n"
+
+                    "✅ JARVIS CAN TRADE AGAIN"
+                )
+
+
+            # =================================================
+            # PAUSE
+            # =================================================
+
             elif command == "/pause":
 
                 bot.entries_paused = True
@@ -504,10 +625,19 @@ class TelegramManager:
                 bot.save_state()
 
                 self.send(
+
                     "⏸ JARVIS PAUSED\n\n"
-                    "No new positions will open."
+
+                    "No new paper trades.\n"
+
+                    "Existing positions are "
+                    "still being managed."
                 )
 
+
+            # =================================================
+            # RESUME
+            # =================================================
 
             elif command == "/resume":
 
@@ -516,9 +646,16 @@ class TelegramManager:
                 bot.save_state()
 
                 self.send(
-                    "▶️ JARVIS RESUMED"
+
+                    "▶️ JARVIS RESUMED\n\n"
+
+                    "New paper trades enabled."
                 )
 
+
+            # =================================================
+            # PAPER
+            # =================================================
 
             elif command == "/paper":
 
@@ -526,13 +663,19 @@ class TelegramManager:
 
                     "📝 MODE\n\n"
 
-                    "REAL MARKET DATA\n"
-                    "PAPER TRADING ONLY\n\n"
+                    "Market data: LIVE\n"
+
+                    "Execution: PAPER TRADING ONLY\n\n"
 
                     "No wallet connected.\n"
-                    "No real funds are being traded."
+
+                    "No real money is being traded."
                 )
 
+
+            # =================================================
+            # HELP
+            # =================================================
 
             elif command == "/help":
 
@@ -540,14 +683,23 @@ class TelegramManager:
 
                     "🤖 JARVIS COMMANDS\n\n"
 
-                    "/status\n"
-                    "/today\n"
-                    "/positions\n"
-                    "/trades\n"
-                    "/scan\n"
-                    "/pause\n"
-                    "/resume\n"
-                    "/paper"
+                    "/status - Dashboard\n"
+
+                    "/today - Current session\n"
+
+                    "/positions - Open trades\n"
+
+                    "/trades - Recent trades\n"
+
+                    "/scan - Scanner activity\n"
+
+                    "/resetday - Reset 30/30 to 0/30\n"
+
+                    "/pause - Pause entries\n"
+
+                    "/resume - Resume entries\n"
+
+                    "/paper - Trading mode"
                 )
 
 
@@ -617,10 +769,6 @@ class DexScreener:
         )
 
 
-    # ========================================================
-    # DISCOVERY
-    # ========================================================
-
     def discover_addresses(self):
 
         feeds = [
@@ -634,22 +782,18 @@ class DexScreener:
             self.community_takeovers()
         ]
 
-
         addresses = []
 
         seen = set()
 
-
-        max_length = max(
+        maximum_length = max(
             [len(feed) for feed in feeds]
             +
             [0]
         )
 
-
-        # Round robin so one feed does not dominate
         for index in range(
-            max_length
+            maximum_length
         ):
 
             for feed in feeds:
@@ -659,7 +803,6 @@ class DexScreener:
 
                 item = feed[index]
 
-
                 if (
                     item.get("chainId")
                     !=
@@ -667,26 +810,21 @@ class DexScreener:
                 ):
                     continue
 
-
                 address = item.get(
                     "tokenAddress"
                 )
 
-
                 if not address:
                     continue
 
-
                 if address in seen:
                     continue
-
 
                 seen.add(address)
 
                 addresses.append(
                     address
                 )
-
 
                 if (
                     len(addresses)
@@ -695,16 +833,10 @@ class DexScreener:
                         "max_discovered_tokens"
                     ]
                 ):
-
                     return addresses
-
 
         return addresses
 
-
-    # ========================================================
-    # BATCH PAIRS
-    # ========================================================
 
     def token_pairs_batch(
         self,
@@ -714,11 +846,9 @@ class DexScreener:
         if not addresses:
             return []
 
-
         joined = ",".join(
             addresses
         )
-
 
         result = http_json(
 
@@ -728,7 +858,6 @@ class DexScreener:
             +
             joined
         )
-
 
         return (
             result
@@ -744,10 +873,11 @@ class DexScreener:
 
         all_pairs = []
 
-        batch_size = CONFIG[
-            "batch_size"
-        ]
-
+        batch_size = (
+            CONFIG[
+                "batch_size"
+            ]
+        )
 
         for start in range(
             0,
@@ -760,21 +890,19 @@ class DexScreener:
                 start + batch_size
             ]
 
-
-            pairs = self.token_pairs_batch(
-                batch
+            pairs = (
+                self.token_pairs_batch(
+                    batch
+                )
             )
-
 
             all_pairs.extend(
                 pairs
             )
 
-
             time.sleep(
                 0.15
             )
-
 
         return all_pairs
 
@@ -786,7 +914,6 @@ class DexScreener:
 
         result = {}
 
-
         for pair in pairs:
 
             if (
@@ -796,21 +923,17 @@ class DexScreener:
             ):
                 continue
 
-
             base = pair.get(
                 "baseToken",
                 {}
             )
 
-
             address = base.get(
                 "address"
             )
 
-
             if not address:
                 continue
-
 
             liquidity = safe_float(
 
@@ -822,26 +945,24 @@ class DexScreener:
                 )
             )
 
-
             if liquidity <= 0:
                 continue
 
-
-            current = result.get(
+            existing = result.get(
                 address
             )
 
+            if existing is None:
 
-            if current is None:
-
-                result[address] = pair
+                result[
+                    address
+                ] = pair
 
                 continue
 
-
             old_liquidity = safe_float(
 
-                current.get(
+                existing.get(
                     "liquidity",
                     {}
                 ).get(
@@ -849,11 +970,11 @@ class DexScreener:
                 )
             )
 
-
             if liquidity > old_liquidity:
 
-                result[address] = pair
-
+                result[
+                    address
+                ] = pair
 
         return result
 
@@ -867,11 +988,9 @@ class DexScreener:
             [address]
         )
 
-
         best = self.best_pairs_by_token(
             pairs
         )
-
 
         return best.get(
             address
@@ -888,43 +1007,65 @@ class JarvisBot:
 
         self.dex = DexScreener()
 
-        self.telegram = TelegramManager()
+        self.telegram = (
+            TelegramManager()
+        )
 
 
-        self.balance = CONFIG[
-            "starting_balance"
-        ]
+        # ====================================================
+        # ACCOUNT
+        # ====================================================
 
+        self.balance = (
+            CONFIG[
+                "starting_balance"
+            ]
+        )
 
         self.positions = {}
 
         self.trade_history = []
 
 
-        self.total_wins = 0
+        # ====================================================
+        # STATS
+        # ====================================================
 
+        self.total_wins = 0
         self.total_losses = 0
 
+
+        # ====================================================
+        # SESSION
+        # ====================================================
 
         self.daily_profit = 0.0
 
         self.daily_entries = 0
 
-
         self.day_key = today_key()
 
-        self.day_start_equity = CONFIG[
-            "starting_balance"
-        ]
+        self.day_start_equity = (
+            CONFIG[
+                "starting_balance"
+            ]
+        )
 
+
+        # ====================================================
+        # CONTROL
+        # ====================================================
 
         self.entries_paused = False
-
 
         self.last_scan = 0
 
         self.last_status = 0
 
+
+        # ====================================================
+        # SCANNER
+        # ====================================================
 
         self.last_discovered = 0
 
@@ -957,7 +1098,6 @@ class JarvisBot:
         ):
             return
 
-
         try:
 
             with open(
@@ -965,7 +1105,9 @@ class JarvisBot:
                 "r"
             ) as file:
 
-                data = json.load(file)
+                data = json.load(
+                    file
+                )
 
 
             self.balance = safe_float(
@@ -1036,14 +1178,24 @@ class JarvisBot:
 
 
             print(
-                "Jarvis saved state loaded."
+                "✅ JARVIS STATE LOADED"
+            )
+
+            print(
+                "Balance:",
+                self.balance
+            )
+
+            print(
+                "Trades this session:",
+                self.daily_entries
             )
 
 
         except Exception as error:
 
             print(
-                "State load error:",
+                "STATE LOAD ERROR:",
                 error
             )
 
@@ -1095,13 +1247,13 @@ class JarvisBot:
         except Exception as error:
 
             print(
-                "Save error:",
+                "STATE SAVE ERROR:",
                 error
             )
 
 
     # ========================================================
-    # REBUILD WINS / LOSSES
+    # STATS
     # ========================================================
 
     def rebuild_stats(self):
@@ -1110,7 +1262,6 @@ class JarvisBot:
 
         self.total_losses = 0
 
-
         for trade in self.trade_history:
 
             profit = safe_float(
@@ -1118,7 +1269,6 @@ class JarvisBot:
                     "profit"
                 )
             )
-
 
             if profit >= 0:
 
@@ -1137,8 +1287,9 @@ class JarvisBot:
 
         open_value = 0.0
 
-
-        for position in self.positions.values():
+        for position in (
+            self.positions.values()
+        ):
 
             open_value += (
 
@@ -1156,7 +1307,6 @@ class JarvisBot:
                     )
                 )
             )
-
 
         return (
             self.balance
@@ -1180,18 +1330,15 @@ class JarvisBot:
 
 
     # ========================================================
-    # DAY RESET
+    # AUTOMATIC NEW DAY RESET
     # ========================================================
 
     def reset_day_if_needed(self):
 
         current = today_key()
 
-
         if current == self.day_key:
-
             return
-
 
         self.day_key = current
 
@@ -1203,19 +1350,63 @@ class JarvisBot:
             self.get_equity()
         )
 
+        self.last_scan = 0
 
         self.save_state()
 
-
         self.telegram.send(
 
-            "🌅 NEW JARVIS TRADING DAY\n\n"
+            "🌅 NEW JARVIS DAY\n\n"
 
-            f"Starting equity: "
-            f"${self.day_start_equity:,.2f}\n"
+            f"Equity: "
+            f"${self.get_equity():,.2f}\n"
 
-            f"Maximum entries: "
-            f"{CONFIG['max_daily_entries']}"
+            f"Trades reset: "
+            f"0/"
+            f"{CONFIG['max_daily_entries']}\n\n"
+
+            "JARVIS IS ACTIVE AGAIN."
+        )
+
+
+    # ========================================================
+    # MANUAL RESET
+    # ========================================================
+
+    def manual_reset_day(self):
+
+        # Account balance stays untouched
+        # Trade history stays untouched
+        # Wins/losses stay untouched
+        # Existing positions stay open
+
+        self.daily_profit = 0.0
+
+        self.daily_entries = 0
+
+        self.day_key = today_key()
+
+        self.day_start_equity = (
+            self.get_equity()
+        )
+
+        # Forces the bot to scan again
+        self.last_scan = 0
+
+        self.save_state()
+
+        print(
+            "🔄 MANUAL PAPER SESSION RESET"
+        )
+
+        print(
+            "Equity:",
+            self.get_equity()
+        )
+
+        print(
+            "Trades:",
+            self.daily_entries
         )
 
 
@@ -1228,7 +1419,6 @@ class JarvisBot:
         if self.day_start_equity <= 0:
             return 0.0
 
-
         change = (
 
             self.get_equity()
@@ -1238,10 +1428,8 @@ class JarvisBot:
             self.day_start_equity
         )
 
-
         if change >= 0:
             return 0.0
-
 
         return (
 
@@ -1272,7 +1460,7 @@ class JarvisBot:
 
 
     # ========================================================
-    # TOKEN NORMALIZATION
+    # PAIR AGE
     # ========================================================
 
     def pair_age_minutes(
@@ -1286,10 +1474,8 @@ class JarvisBot:
             )
         )
 
-
         if created <= 0:
             return None
-
 
         return (
 
@@ -1302,6 +1488,10 @@ class JarvisBot:
         ) / 60
 
 
+    # ========================================================
+    # TOKEN DATA
+    # ========================================================
+
     def pair_to_token(
         self,
         pair
@@ -1312,24 +1502,20 @@ class JarvisBot:
             {}
         )
 
-
-        change = pair.get(
+        changes = pair.get(
             "priceChange",
             {}
         )
 
-
-        txns = pair.get(
+        transactions = pair.get(
             "txns",
             {}
         )
 
-
-        m5 = txns.get(
+        m5 = transactions.get(
             "m5",
             {}
         )
-
 
         buys = safe_int(
             m5.get(
@@ -1337,16 +1523,13 @@ class JarvisBot:
             )
         )
 
-
         sells = safe_int(
             m5.get(
                 "sells"
             )
         )
 
-
         total = buys + sells
-
 
         buy_pressure = (
 
@@ -1361,13 +1544,11 @@ class JarvisBot:
             else 0
         )
 
-
         market_cap = safe_float(
             pair.get(
                 "marketCap"
             )
         )
-
 
         if market_cap <= 0:
 
@@ -1376,7 +1557,6 @@ class JarvisBot:
                     "fdv"
                 )
             )
-
 
         return {
 
@@ -1432,14 +1612,14 @@ class JarvisBot:
 
             "change5":
                 safe_float(
-                    change.get(
+                    changes.get(
                         "m5"
                     )
                 ),
 
             "change1h":
                 safe_float(
-                    change.get(
+                    changes.get(
                         "h1"
                     )
                 ),
@@ -1472,8 +1652,6 @@ class JarvisBot:
         score = 0
 
 
-        # LIQUIDITY
-
         if token["liquidity"] >= 250000:
             score += 20
 
@@ -1486,8 +1664,6 @@ class JarvisBot:
         elif token["liquidity"] >= 25000:
             score += 10
 
-
-        # VOLUME
 
         if token["volume"] >= 1000000:
             score += 20
@@ -1502,8 +1678,6 @@ class JarvisBot:
             score += 10
 
 
-        # 5M MOMENTUM
-
         if 4 <= token["change5"] <= 15:
             score += 20
 
@@ -1514,16 +1688,12 @@ class JarvisBot:
             score += 10
 
 
-        # 1H MOMENTUM
-
         if 5 <= token["change1h"] <= 40:
             score += 15
 
         elif -5 <= token["change1h"] < 5:
             score += 8
 
-
-        # BUY PRESSURE
 
         if token["buy_pressure"] >= 70:
             score += 20
@@ -1535,8 +1705,6 @@ class JarvisBot:
             score += 8
 
 
-        # MARKET CAP
-
         if (
             75000
             <=
@@ -1544,7 +1712,6 @@ class JarvisBot:
             <=
             1000000
         ):
-
             score += 10
 
 
@@ -1555,7 +1722,6 @@ class JarvisBot:
             <=
             5000000
         ):
-
             score += 6
 
 
@@ -1678,9 +1844,7 @@ class JarvisBot:
             return False
 
 
-        age = token[
-            "age"
-        ]
+        age = token["age"]
 
 
         if age is not None:
@@ -1695,7 +1859,7 @@ class JarvisBot:
                 return False
 
 
-            max_age = (
+            maximum_age = (
 
                 CONFIG[
                     "max_pair_age_days"
@@ -1711,7 +1875,7 @@ class JarvisBot:
             )
 
 
-            if age > max_age:
+            if age > maximum_age:
                 return False
 
 
@@ -1735,7 +1899,7 @@ class JarvisBot:
 
 
     # ========================================================
-    # SCAN
+    # SCANNER
     # ========================================================
 
     def scan_market(self):
@@ -1745,7 +1909,6 @@ class JarvisBot:
             .discover_addresses()
         )
 
-
         self.last_discovered = len(
             addresses
         )
@@ -1754,7 +1917,12 @@ class JarvisBot:
         if not addresses:
 
             self.last_pairs = 0
+
             self.last_qualified = 0
+
+            self.last_scan_time = (
+                now_sydney()
+            )
 
             return []
 
@@ -1786,13 +1954,14 @@ class JarvisBot:
                 address
             )
 
-
             if not pair:
                 continue
 
 
-            token = self.pair_to_token(
-                pair
+            token = (
+                self.pair_to_token(
+                    pair
+                )
             )
 
 
@@ -1807,8 +1976,8 @@ class JarvisBot:
 
         candidates.sort(
 
-            key=lambda x:
-                x["score"],
+            key=lambda token:
+                token["score"],
 
             reverse=True
         )
@@ -1827,31 +1996,44 @@ class JarvisBot:
         if candidates:
 
             self.last_best_symbol = (
-                candidates[0]["symbol"]
+                candidates[0][
+                    "symbol"
+                ]
             )
 
             self.last_best_score = (
-                candidates[0]["score"]
+                candidates[0][
+                    "score"
+                ]
             )
+
 
         else:
 
-            self.last_best_symbol = "NONE"
+            self.last_best_symbol = (
+                "NONE"
+            )
+
             self.last_best_score = 0
 
 
         print(
 
-            "SCAN",
+            "SCAN |",
 
-            "| discovered",
+            "discovered:",
             self.last_discovered,
 
-            "| pairs",
+            "pairs:",
             self.last_pairs,
 
-            "| qualified",
-            self.last_qualified
+            "qualified:",
+            self.last_qualified,
+
+            "best:",
+            self.last_best_symbol,
+
+            self.last_best_score
         )
 
 
@@ -1864,7 +2046,9 @@ class JarvisBot:
 
     def position_size(self):
 
-        equity = self.get_equity()
+        equity = (
+            self.get_equity()
+        )
 
 
         maximum = (
@@ -1883,9 +2067,14 @@ class JarvisBot:
         )
 
 
-        return min(
-            maximum,
-            self.balance
+        return max(
+
+            0,
+
+            min(
+                maximum,
+                self.balance
+            )
         )
 
 
@@ -1898,10 +2087,7 @@ class JarvisBot:
         token
     ):
 
-        # IMPORTANT:
-        # The entry limit is checked again HERE.
-        # This fixes the old 32/30 bug.
-
+        # HARD 30 TRADE LIMIT
         if (
             self.daily_entries
             >=
@@ -1909,7 +2095,6 @@ class JarvisBot:
                 "max_daily_entries"
             ]
         ):
-
             return False
 
 
@@ -1928,7 +2113,6 @@ class JarvisBot:
                 "max_open_positions"
             ]
         ):
-
             return False
 
 
@@ -1971,14 +2155,10 @@ class JarvisBot:
         ] = {
 
             "symbol":
-                token[
-                    "symbol"
-                ],
+                token["symbol"],
 
             "name":
-                token[
-                    "name"
-                ],
+                token["name"],
 
             "entry_price":
                 price,
@@ -1996,9 +2176,7 @@ class JarvisBot:
                 amount,
 
             "score":
-                token[
-                    "score"
-                ],
+                token["score"],
 
             "opened_at":
                 now_sydney()
@@ -2009,7 +2187,6 @@ class JarvisBot:
         self.balance -= amount
 
         self.daily_entries += 1
-
 
         self.save_state()
 
@@ -2054,7 +2231,7 @@ class JarvisBot:
             f"Stop: "
             f"-{CONFIG['stop_loss_pct']}%\n\n"
 
-            f"Trades today: "
+            f"Trades this session: "
             f"{self.daily_entries}/"
             f"{CONFIG['max_daily_entries']}"
         )
@@ -2077,9 +2254,11 @@ class JarvisBot:
                 continue
 
 
-            position = self.positions[
-                address
-            ]
+            position = (
+                self.positions[
+                    address
+                ]
+            )
 
 
             pair = self.dex.best_pair(
@@ -2110,9 +2289,11 @@ class JarvisBot:
             if (
                 price
                 >
-                position[
-                    "highest_price"
-                ]
+                safe_float(
+                    position.get(
+                        "highest_price"
+                    )
+                )
             ):
 
                 position[
@@ -2120,9 +2301,15 @@ class JarvisBot:
                 ] = price
 
 
-            entry = position[
-                "entry_price"
-            ]
+            entry = safe_float(
+                position.get(
+                    "entry_price"
+                )
+            )
+
+
+            if entry <= 0:
+                continue
 
 
             pnl_pct = (
@@ -2143,12 +2330,14 @@ class JarvisBot:
             )
 
 
-            highest = position[
-                "highest_price"
-            ]
+            highest = safe_float(
+                position.get(
+                    "highest_price"
+                )
+            )
 
 
-            highest_profit = (
+            highest_profit_pct = (
 
                 (
                     highest
@@ -2194,11 +2383,15 @@ class JarvisBot:
                     "symbol"
                 ],
 
+                "| P/L",
+
                 f"{pnl_pct:+.2f}%"
             )
 
 
+            # ------------------------------------------------
             # STOP LOSS
+            # ------------------------------------------------
 
             if (
                 pnl_pct
@@ -2216,7 +2409,9 @@ class JarvisBot:
                 continue
 
 
+            # ------------------------------------------------
             # TAKE PROFIT
+            # ------------------------------------------------
 
             if (
                 pnl_pct
@@ -2234,12 +2429,16 @@ class JarvisBot:
                 continue
 
 
+            # ------------------------------------------------
             # TRAILING STOP
+            # ------------------------------------------------
 
             if (
 
-                highest_profit
+                highest_profit_pct
+
                 >=
+
                 CONFIG[
                     "trailing_activation_pct"
                 ]
@@ -2247,7 +2446,9 @@ class JarvisBot:
                 and
 
                 drop_from_high
+
                 >=
+
                 CONFIG[
                     "trailing_stop_pct"
                 ]
@@ -2279,53 +2480,59 @@ class JarvisBot:
             return
 
 
-        position = self.positions[
-            address
-        ]
+        position = (
+            self.positions[
+                address
+            ]
+        )
 
 
-        exit_price = position[
-            "current_price"
-        ]
+        exit_price = safe_float(
+            position.get(
+                "current_price"
+            )
+        )
+
+
+        quantity = safe_float(
+            position.get(
+                "quantity"
+            )
+        )
+
+
+        amount = safe_float(
+            position.get(
+                "amount"
+            )
+        )
 
 
         value = (
-
-            position[
-                "quantity"
-            ]
-
+            quantity
             *
-
             exit_price
         )
 
 
         profit = (
-
             value
-
             -
-
-            position[
-                "amount"
-            ]
+            amount
         )
 
 
         pnl_pct = (
 
             profit
-
             /
-
-            position[
-                "amount"
-            ]
-
+            amount
             *
-
             100
+
+            if amount > 0
+
+            else 0
         )
 
 
@@ -2337,9 +2544,16 @@ class JarvisBot:
         self.trade_history.append({
 
             "symbol":
-                position[
-                    "symbol"
-                ],
+                position.get(
+                    "symbol",
+                    "UNKNOWN"
+                ),
+
+            "name":
+                position.get(
+                    "name",
+                    "Unknown"
+                ),
 
             "profit":
                 profit,
@@ -2367,8 +2581,11 @@ class JarvisBot:
 
 
         icon = (
+
             "🟢"
+
             if profit >= 0
+
             else "🔴"
         )
 
@@ -2377,8 +2594,8 @@ class JarvisBot:
 
             f"{icon} PAPER TRADE CLOSED\n\n"
 
-            f"{position['name']} "
-            f"({position['symbol']})\n\n"
+            f"{position.get('name')} "
+            f"({position.get('symbol')})\n\n"
 
             f"Reason: "
             f"{reason}\n"
@@ -2389,7 +2606,7 @@ class JarvisBot:
             f"P/L: "
             f"${profit:+.2f}\n\n"
 
-            f"Today's P/L: "
+            f"Session P/L: "
             f"${self.daily_profit:+.2f}\n"
 
             f"Total P/L: "
@@ -2401,7 +2618,7 @@ class JarvisBot:
 
 
     # ========================================================
-    # FAST ENTRY ENGINE
+    # ENTRY ENGINE
     # ========================================================
 
     def try_new_entries(self):
@@ -2421,7 +2638,6 @@ class JarvisBot:
                 "max_daily_entries"
             ]
         ):
-
             return
 
 
@@ -2432,18 +2648,17 @@ class JarvisBot:
                 "max_open_positions"
             ]
         ):
-
             return
 
 
-        candidates = self.scan_market()
+        candidates = (
+            self.scan_market()
+        )
 
 
         if not candidates:
             return
 
-
-        # Fill available slots with strongest candidates.
 
         for token in candidates:
 
@@ -2454,12 +2669,8 @@ class JarvisBot:
                     "max_open_positions"
                 ]
             ):
-
                 break
 
-
-            # Check limit on EVERY iteration.
-            # Prevents 31/30 or 32/30.
 
             if (
                 self.daily_entries
@@ -2468,18 +2679,15 @@ class JarvisBot:
                     "max_daily_entries"
                 ]
             ):
-
                 break
 
 
-            if (
-                token[
-                    "address"
-                ]
-                in
-                self.positions
-            ):
+            address = token[
+                "address"
+            ]
 
+
+            if address in self.positions:
                 continue
 
 
@@ -2496,17 +2704,14 @@ class JarvisBot:
 
 
     # ========================================================
-    # STATUS - MATCHES THE SCREENSHOT STYLE
+    # STATUS
     # ========================================================
 
     def status_message(self):
 
         closed = (
-
             self.total_wins
-
             +
-
             self.total_losses
         )
 
@@ -2514,19 +2719,49 @@ class JarvisBot:
         win_rate = (
 
             self.total_wins
-
             /
-
             closed
-
             *
-
             100
 
             if closed > 0
 
             else 0
         )
+
+
+        if self.daily_loss_hit():
+
+            status = (
+                "🛑 DAILY LOSS STOP"
+            )
+
+
+        elif self.entries_paused:
+
+            status = (
+                "⏸ PAUSED"
+            )
+
+
+        elif (
+            self.daily_entries
+            >=
+            CONFIG[
+                "max_daily_entries"
+            ]
+        ):
+
+            status = (
+                "🟡 SESSION LIMIT"
+            )
+
+
+        else:
+
+            status = (
+                "🟢 ACTIVE"
+            )
 
 
         return (
@@ -2561,6 +2796,9 @@ class JarvisBot:
             f"{self.daily_entries}/"
             f"{CONFIG['max_daily_entries']}\n\n"
 
+            f"Status: "
+            f"{status}\n"
+
             "Mode: PAPER TRADING"
         )
 
@@ -2573,21 +2811,30 @@ class JarvisBot:
 
         return (
 
-            "📅 TODAY\n\n"
+            "📅 JARVIS SESSION\n\n"
 
             f"P/L: "
-            f"${self.daily_profit:+,.2f}\n"
+            f"${self.daily_profit:+.2f}\n"
+
+            f"Trades: "
+            f"{self.daily_entries}/"
+            f"{CONFIG['max_daily_entries']}\n"
+
+            f"Open trades: "
+            f"{len(self.positions)}\n\n"
 
             f"Equity: "
             f"${self.get_equity():,.2f}\n"
 
-            f"Trades: "
-            f"{self.daily_entries}/"
-            f"{CONFIG['max_daily_entries']}\n\n"
+            f"Total P/L: "
+            f"${self.total_profit():+,.2f}\n\n"
 
-            f"Daily loss used: "
+            f"Loss used: "
             f"{self.daily_loss_pct():.2f}%/"
-            f"{CONFIG['max_daily_loss_pct']:.2f}%"
+            f"{CONFIG['max_daily_loss_pct']:.2f}%\n\n"
+
+            "Use /resetday for another "
+            "paper-testing session."
         )
 
 
@@ -2600,7 +2847,9 @@ class JarvisBot:
         if not self.positions:
 
             return (
+
                 "📊 OPEN POSITIONS\n\n"
+
                 "No open paper trades."
             )
 
@@ -2610,16 +2859,22 @@ class JarvisBot:
         )
 
 
-        for position in self.positions.values():
+        for position in (
+            self.positions.values()
+        ):
 
-            entry = position[
-                "entry_price"
-            ]
+            entry = safe_float(
+                position.get(
+                    "entry_price"
+                )
+            )
 
 
-            current = position[
-                "current_price"
-            ]
+            current = safe_float(
+                position.get(
+                    "current_price"
+                )
+            )
 
 
             pnl = (
@@ -2637,12 +2892,16 @@ class JarvisBot:
                 *
 
                 100
+
+                if entry > 0
+
+                else 0
             )
 
 
             message += (
 
-                f"{position['symbol']}\n"
+                f"{position.get('symbol')}\n"
 
                 f"Entry: "
                 f"${entry:.10f}\n"
@@ -2654,7 +2913,7 @@ class JarvisBot:
                 f"{pnl:+.2f}%\n"
 
                 f"Size: "
-                f"${position['amount']:.2f}\n\n"
+                f"${safe_float(position.get('amount')):.2f}\n\n"
             )
 
 
@@ -2694,8 +2953,11 @@ class JarvisBot:
 
 
             icon = (
+
                 "🟢"
+
                 if profit >= 0
+
                 else "🔴"
             )
 
@@ -2756,40 +3018,36 @@ class JarvisBot:
             f"Best score: "
             f"{self.last_best_score}/100\n\n"
 
-            "Scanner mode: FAST"
+            "Scanner: ⚡ FAST"
         )
 
 
     # ========================================================
-    # RUN
+    # MAIN LOOP
     # ========================================================
 
     def run(self):
 
         self.telegram.send(
 
-            "🤖 JARVIS CLASSIC FAST ONLINE\n\n"
+            "🤖 JARVIS CLASSIC FAST V3 ONLINE\n\n"
 
             "Real Solana market data\n"
 
-            "PAPER TRADING ONLY\n\n"
+            "Execution: PAPER ONLY\n\n"
 
-            f"Starting equity: "
+            f"Current equity: "
             f"${self.get_equity():,.2f}\n"
 
-            f"Max positions: "
-            f"{CONFIG['max_open_positions']}\n"
+            f"Current trades: "
+            f"{self.daily_entries}/"
+            f"{CONFIG['max_daily_entries']}\n\n"
 
-            f"Max trades/day: "
-            f"{CONFIG['max_daily_entries']}\n"
+            "🔄 /resetday IS ENABLED\n\n"
 
-            f"Stop: "
-            f"-{CONFIG['stop_loss_pct']}%\n"
-
-            f"Take profit: "
-            f"+{CONFIG['take_profit_pct']}%\n\n"
-
-            "Send /status anytime."
+            "Use it to reset the paper "
+            "session to 0/30 while keeping "
+            "your balance and history."
         )
 
 
@@ -2800,8 +3058,16 @@ class JarvisBot:
 
             try:
 
+                # --------------------------------------------
+                # AUTOMATIC MIDNIGHT RESET
+                # --------------------------------------------
+
                 self.reset_day_if_needed()
 
+
+                # --------------------------------------------
+                # TELEGRAM COMMANDS
+                # --------------------------------------------
 
                 self.telegram.handle_commands(
                     self
@@ -2811,14 +3077,14 @@ class JarvisBot:
                 current = time.time()
 
 
+                # --------------------------------------------
                 # UPDATE OPEN TRADES
+                # --------------------------------------------
 
                 if (
 
                     current
-
                     -
-
                     last_price_update
 
                     >=
@@ -2836,14 +3102,14 @@ class JarvisBot:
                     )
 
 
-                # FAST MARKET SCAN
+                # --------------------------------------------
+                # SCAN
+                # --------------------------------------------
 
                 if (
 
                     current
-
                     -
-
                     self.last_scan
 
                     >=
@@ -2861,14 +3127,14 @@ class JarvisBot:
                     )
 
 
+                # --------------------------------------------
                 # AUTO STATUS
+                # --------------------------------------------
 
                 if (
 
                     current
-
                     -
-
                     self.last_status
 
                     >=
@@ -2898,7 +3164,7 @@ class JarvisBot:
                 self.save_state()
 
                 print(
-                    "Jarvis stopped."
+                    "JARVIS STOPPED"
                 )
 
                 break
