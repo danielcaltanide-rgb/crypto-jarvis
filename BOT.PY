@@ -1,2444 +1,4327 @@
-# ============================================================
-# 🤖 JARVIS CRYPTO RESEARCH BOT — SAFER PAPER TRADING VERSION
-# ============================================================
-#
-# PAPER TRADING ONLY
-# NO REAL WALLET
-# NO PRIVATE KEYS
-# NO REAL ORDERS
-#
-# Designed for:
-# - Solana token research
-# - DexScreener market data
-# - Telegram control
-# - Stronger risk protection
-# - Trade journaling
-# - Daily reset
-# - Loss-streak protection
-# - Cooldown system
-#
-# ============================================================
+from __future__ import annotations
 
-import os
+import asyncio
 import json
-import time
+import logging
 import math
-import traceback
-import requests
-from datetime import datetime, timedelta
+import os
+import re
+import time
+from collections import Counter
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from html import escape
+from pathlib import Path
+from typing import Any, Mapping
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
-
-# ============================================================
-# 1. SETTINGS
-# ============================================================
-
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-TIMEZONE = ZoneInfo("Australia/Sydney")
-
-STATE_FILE = "jarvis_state.json"
-JOURNAL_FILE = "jarvis_trade_journal.json"
-
-STARTING_BALANCE = 1000.00
-
-
-# -------------------------
-# RISK SETTINGS
-# -------------------------
-
-RISK_PER_TRADE_PCT = 0.50
-MAX_DAILY_LOSS_PCT = 2.00
-
-MAX_OPEN_POSITIONS = 2
-MAX_DAILY_ENTRIES = 10
-
-MAX_CONSECUTIVE_LOSSES = 3
-
-COOLDOWN_AFTER_LOSSES = 2
-COOLDOWN_MINUTES = 60
-
-
-# -------------------------
-# EXIT SETTINGS
-# -------------------------
-
-STOP_LOSS_PCT = 6.0
-
-TAKE_PROFIT_PCT = 15.0
-
-TRAILING_ACTIVATION_PCT = 7.0
-TRAILING_STOP_PCT = 5.0
-
-MAX_HOLD_MINUTES = 180
-
-
-# -------------------------
-# TOKEN FILTERS
-# -------------------------
-
-MIN_LIQUIDITY = 50_000
-MIN_VOLUME_24H = 100_000
-
-MIN_MARKET_CAP = 75_000
-MAX_MARKET_CAP = 5_000_000
-
-MIN_PAIR_AGE_MINUTES = 15
-MAX_PAIR_AGE_DAYS = 30
-
-MIN_5M_CHANGE = 1.0
-MAX_5M_CHANGE = 15.0
-
-MIN_1H_CHANGE = 2.0
-MAX_1H_CHANGE = 60.0
-
-MIN_6H_CHANGE = -5.0
-MAX_6H_CHANGE = 150.0
-
-MIN_5M_BUYS = 8
-
-MIN_BUY_RATIO = 0.58
-
-MIN_SCORE = 76
-
-
-# -------------------------
-# LOOP TIMING
-# -------------------------
-
-SCAN_INTERVAL_SECONDS = 40
-POSITION_UPDATE_SECONDS = 10
-STATUS_INTERVAL_SECONDS = 600
-
-MAX_TOKENS_PER_SCAN = 35
-
-
-DEX_PROFILES_URL = (
-    "https://api.dexscreener.com/token-profiles/latest/v1"
-)
-
-DEX_TOKEN_PAIRS_URL = (
-    "https://api.dexscreener.com/token-pairs/v1/solana/{}"
-)
-
-TELEGRAM_BASE = (
-    f"https://api.telegram.org/bot{BOT_TOKEN}"
+import aiohttp
+from aiohttp import web
+from dotenv import load_dotenv
+from telegram import BotCommand, Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
 )
 
 
 # ============================================================
-# 2. UTILITIES
+# HELPERS
 # ============================================================
 
-def now():
-    return datetime.now(TIMEZONE)
-
-
-def today_string():
-    return now().strftime("%Y-%m-%d")
-
-
-def timestamp_string():
-    return now().isoformat()
-
-
-def safe_float(value, default=0.0):
+def safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        if value is None:
-            return default
-        return float(value)
-    except:
+        result = float(value)
+    except (TypeError, ValueError):
         return default
+    return result if math.isfinite(result) else default
 
 
-def safe_int(value, default=0):
+def safe_int(value: Any, default: int = 0) -> int:
     try:
-        if value is None:
-            return default
         return int(value)
-    except:
+    except (TypeError, ValueError):
         return default
 
 
-def clamp(value, low, high):
-    return max(low, min(value, high))
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def money(value):
-    return f"${value:,.2f}"
+def iso_now() -> str:
+    return utc_now().isoformat()
 
 
-def pct(value):
-    return f"{value:.2f}%"
-
-
-# ============================================================
-# 3. TELEGRAM
-# ============================================================
-
-def telegram_send(message, chat_id=None):
-
-    target = str(chat_id or CHAT_ID).strip()
-
-    if not BOT_TOKEN or not target:
-        print(message)
-        return
-
-    try:
-
-        requests.post(
-            f"{TELEGRAM_BASE}/sendMessage",
-            json={
-                "chat_id": target,
-                "text": message
-            },
-            timeout=15
-        )
-
-    except Exception as e:
-        print("Telegram send error:", e)
-
-
-def telegram_updates(offset=None):
-
-    if not BOT_TOKEN:
-        return []
-
-    params = {
-        "timeout": 2
-    }
-
-    if offset is not None:
-        params["offset"] = offset
-
-    try:
-
-        response = requests.get(
-            f"{TELEGRAM_BASE}/getUpdates",
-            params=params,
-            timeout=8
-        )
-
-        data = response.json()
-
-        if not data.get("ok"):
-            return []
-
-        return data.get("result", [])
-
-    except:
-        return []
-
-
-# ============================================================
-# 4. STATE
-# ============================================================
-
-def default_state():
-
-    return {
-
-        "cash": STARTING_BALANCE,
-
-        "positions": {},
-
-        "closed_trades": [],
-
-        "date": today_string(),
-
-        "session_start_equity": STARTING_BALANCE,
-
-        "daily_start_equity": STARTING_BALANCE,
-
-        "daily_realised_pnl": 0.0,
-
-        "daily_entries": 0,
-
-        "wins": 0,
-
-        "losses": 0,
-
-        "consecutive_losses": 0,
-
-        "entries_paused": False,
-
-        "cooldown_until": None,
-
-        "last_scan": None,
-
-        "last_status": None,
-
-        "telegram_offset": None,
-
-        "total_scans": 0,
-
-        "candidates_seen": 0,
-
-        "candidates_rejected": 0,
-
-        "candidates_passed": 0
-    }
-
-
-def load_state():
-
-    if not os.path.exists(STATE_FILE):
-        return default_state()
-
-    try:
-
-        with open(STATE_FILE, "r") as f:
-            saved = json.load(f)
-
-        defaults = default_state()
-
-        for key, value in defaults.items():
-
-            if key not in saved:
-                saved[key] = value
-
-        return saved
-
-    except Exception:
-
-        return default_state()
-
-
-def save_state():
-
-    try:
-
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
-
-    except Exception as e:
-        print("State save error:", e)
-
-
-state = load_state()
-
-
-# ============================================================
-# 5. JOURNAL
-# ============================================================
-
-def load_journal():
-
-    if not os.path.exists(JOURNAL_FILE):
-        return []
-
-    try:
-
-        with open(JOURNAL_FILE, "r") as f:
-            return json.load(f)
-
-    except:
-        return []
-
-
-def save_journal(journal):
-
-    try:
-
-        with open(JOURNAL_FILE, "w") as f:
-            json.dump(journal, f, indent=2)
-
-    except Exception as e:
-        print("Journal error:", e)
-
-
-def journal_trade(trade):
-
-    journal = load_journal()
-
-    journal.append(trade)
-
-    save_journal(journal)
-
-
-# ============================================================
-# 6. DEXSCREENER
-# ============================================================
-
-session = requests.Session()
-
-session.headers.update({
-    "User-Agent": "JarvisPaperResearchBot/2.0"
-})
-
-
-def get_latest_profiles():
-
-    try:
-
-        r = session.get(
-            DEX_PROFILES_URL,
-            timeout=15
-        )
-
-        r.raise_for_status()
-
-        data = r.json()
-
-        if not isinstance(data, list):
-            return []
-
-        solana = []
-
-        for token in data:
-
-            if token.get("chainId") == "solana":
-
-                address = token.get("tokenAddress")
-
-                if address:
-                    solana.append(address)
-
-        return solana[:MAX_TOKENS_PER_SCAN]
-
-    except Exception as e:
-
-        print("Profile error:", e)
-
-        return []
-
-
-def get_pairs(token_address):
-
-    try:
-
-        url = DEX_TOKEN_PAIRS_URL.format(
-            token_address
-        )
-
-        r = session.get(
-            url,
-            timeout=15
-        )
-
-        r.raise_for_status()
-
-        data = r.json()
-
-        if isinstance(data, list):
-            return data
-
-        return []
-
-    except:
-        return []
-
-
-def best_pair_for_token(token_address):
-
-    pairs = get_pairs(token_address)
-
-    if not pairs:
-        return None
-
-    pairs = [
-        p for p in pairs
-        if p.get("chainId") == "solana"
-    ]
-
-    if not pairs:
-        return None
-
-    pairs.sort(
-        key=lambda p:
-        safe_float(
-            (p.get("liquidity") or {}).get("usd")
-        ),
-        reverse=True
-    )
-
-    return pairs[0]
-
-
-# ============================================================
-# 7. MARKET DATA EXTRACTION
-# ============================================================
-
-def pair_market_data(pair):
-
-    price_change = pair.get("priceChange") or {}
-
-    txns = pair.get("txns") or {}
-
-    m5_tx = txns.get("m5") or {}
-    h1_tx = txns.get("h1") or {}
-
-    buys_5m = safe_int(
-        m5_tx.get("buys")
-    )
-
-    sells_5m = safe_int(
-        m5_tx.get("sells")
-    )
-
-    buys_1h = safe_int(
-        h1_tx.get("buys")
-    )
-
-    sells_1h = safe_int(
-        h1_tx.get("sells")
-    )
-
-    total_5m = buys_5m + sells_5m
-
-    buy_ratio = (
-        buys_5m / total_5m
-        if total_5m > 0
-        else 0
-    )
-
-    created_ms = safe_int(
-        pair.get("pairCreatedAt")
-    )
-
-    age_minutes = 999999
-
-    if created_ms > 0:
-
-        created = datetime.fromtimestamp(
-            created_ms / 1000,
-            tz=TIMEZONE
-        )
-
-        age_minutes = (
-            now() - created
-        ).total_seconds() / 60
-
-    market_cap = safe_float(
-        pair.get("marketCap")
-    )
-
-    if market_cap <= 0:
-        market_cap = safe_float(
-            pair.get("fdv")
-        )
-
-    return {
-
-        "pair_address":
-            pair.get("pairAddress", ""),
-
-        "token_address":
-            (pair.get("baseToken") or {})
-            .get("address", ""),
-
-        "symbol":
-            (pair.get("baseToken") or {})
-            .get("symbol", "UNKNOWN"),
-
-        "name":
-            (pair.get("baseToken") or {})
-            .get("name", "Unknown"),
-
-        "price":
-            safe_float(
-                pair.get("priceUsd")
-            ),
-
-        "liquidity":
-            safe_float(
-                (pair.get("liquidity") or {})
-                .get("usd")
-            ),
-
-        "volume24":
-            safe_float(
-                (pair.get("volume") or {})
-                .get("h24")
-            ),
-
-        "volume6":
-            safe_float(
-                (pair.get("volume") or {})
-                .get("h6")
-            ),
-
-        "volume1":
-            safe_float(
-                (pair.get("volume") or {})
-                .get("h1")
-            ),
-
-        "volume5":
-            safe_float(
-                (pair.get("volume") or {})
-                .get("m5")
-            ),
-
-        "market_cap":
-            market_cap,
-
-        "change5":
-            safe_float(
-                price_change.get("m5")
-            ),
-
-        "change1":
-            safe_float(
-                price_change.get("h1")
-            ),
-
-        "change6":
-            safe_float(
-                price_change.get("h6")
-            ),
-
-        "change24":
-            safe_float(
-                price_change.get("h24")
-            ),
-
-        "buys5":
-            buys_5m,
-
-        "sells5":
-            sells_5m,
-
-        "buys1":
-            buys_1h,
-
-        "sells1":
-            sells_1h,
-
-        "buy_ratio":
-            buy_ratio,
-
-        "age_minutes":
-            age_minutes,
-
-        "dex":
-            pair.get("dexId", ""),
-
-        "url":
-            pair.get("url", "")
-    }
-
-
-# ============================================================
-# 8. QUALITY FILTER
-# ============================================================
-
-def reject_reason(data):
-
-    if data["price"] <= 0:
-        return "invalid price"
-
-    if data["liquidity"] < MIN_LIQUIDITY:
-        return "low liquidity"
-
-    if data["volume24"] < MIN_VOLUME_24H:
-        return "low volume"
-
-    if not (
-        MIN_MARKET_CAP
-        <= data["market_cap"]
-        <= MAX_MARKET_CAP
-    ):
-        return "market cap"
-
-    if data["age_minutes"] < MIN_PAIR_AGE_MINUTES:
-        return "too new"
-
-    if data["age_minutes"] > MAX_PAIR_AGE_DAYS * 1440:
-        return "too old"
-
-    if data["buys5"] < MIN_5M_BUYS:
-        return "not enough buys"
-
-    if data["buy_ratio"] < MIN_BUY_RATIO:
-        return "weak buy pressure"
-
-    if not (
-        MIN_5M_CHANGE
-        <= data["change5"]
-        <= MAX_5M_CHANGE
-    ):
-        return "5m momentum"
-
-    if not (
-        MIN_1H_CHANGE
-        <= data["change1"]
-        <= MAX_1H_CHANGE
-    ):
-        return "1h trend"
-
-    if not (
-        MIN_6H_CHANGE
-        <= data["change6"]
-        <= MAX_6H_CHANGE
-    ):
-        return "6h regime"
-
-    # Avoid severe momentum disagreement
-
-    if data["change1"] > 0 and data["change5"] < 0:
-        return "momentum conflict"
-
-    return None
-
-
-# ============================================================
-# 9. SCORE
-# ============================================================
-
-def calculate_score(d):
-
-    score = 0
-
-
-    # --------------------------------
-    # Liquidity
-    # --------------------------------
-
-    if d["liquidity"] >= 250_000:
-        score += 15
-
-    elif d["liquidity"] >= 150_000:
-        score += 12
-
-    elif d["liquidity"] >= 100_000:
-        score += 9
-
-    else:
-        score += 6
-
-
-    # --------------------------------
-    # 24h Volume
-    # --------------------------------
-
-    if d["volume24"] >= 1_000_000:
-        score += 15
-
-    elif d["volume24"] >= 500_000:
-        score += 12
-
-    elif d["volume24"] >= 250_000:
-        score += 9
-
-    else:
-        score += 6
-
-
-    # --------------------------------
-    # 5m momentum
-    # --------------------------------
-
-    if 2 <= d["change5"] <= 7:
-        score += 15
-
-    elif 1 <= d["change5"] <= 10:
-        score += 11
-
-    else:
-        score += 5
-
-
-    # --------------------------------
-    # 1h trend
-    # --------------------------------
-
-    if 5 <= d["change1"] <= 25:
-        score += 15
-
-    elif 2 <= d["change1"] <= 40:
-        score += 10
-
-    else:
-        score += 4
-
-
-    # --------------------------------
-    # 6h regime filter
-    # --------------------------------
-
-    if 5 <= d["change6"] <= 60:
-        score += 12
-
-    elif 0 <= d["change6"] <= 100:
-        score += 8
-
-    else:
-        score += 3
-
-
-    # --------------------------------
-    # Buy pressure
-    # --------------------------------
-
-    ratio = d["buy_ratio"]
-
-    if ratio >= 0.72:
-        score += 15
-
-    elif ratio >= 0.65:
-        score += 12
-
-    elif ratio >= 0.58:
-        score += 8
-
-
-    # --------------------------------
-    # Pair age
-    # --------------------------------
-
-    hours = d["age_minutes"] / 60
-
-    if 1 <= hours <= 48:
-        score += 8
-
-    elif 0.25 <= hours <= 168:
-        score += 6
-
-    else:
-        score += 3
-
-
-    # --------------------------------
-    # Market cap
-    # --------------------------------
-
-    if 150_000 <= d["market_cap"] <= 2_000_000:
-        score += 5
-
-    elif d["market_cap"] <= MAX_MARKET_CAP:
-        score += 3
-
-
-    return min(score, 100)
-
-
-# ============================================================
-# 10. EQUITY
-# ============================================================
-
-def get_equity():
-
-    equity = state["cash"]
-
-    for pos in state["positions"].values():
-
-        equity += (
-            pos["quantity"]
-            * pos.get(
-                "current_price",
-                pos["entry_price"]
-            )
-        )
-
-    return equity
-
-
-def open_pnl():
-
-    total = 0
-
-    for pos in state["positions"].values():
-
-        value_now = (
-            pos["quantity"]
-            * pos.get(
-                "current_price",
-                pos["entry_price"]
-            )
-        )
-
-        total += (
-            value_now
-            - pos["position_value"]
-        )
-
-    return total
-
-
-# ============================================================
-# 11. DAILY LOSS
-# ============================================================
-
-def daily_loss_pct():
-
-    start = state["daily_start_equity"]
-
-    if start <= 0:
-        return 0
-
-    equity = get_equity()
-
-    loss = max(
-        0,
-        start - equity
-    )
-
-    return (
-        loss / start
-    ) * 100
-
-
-def daily_loss_dollars():
-
-    start = state["daily_start_equity"]
-
-    return max(
-        0,
-        start - get_equity()
-    )
-
-
-def maximum_daily_loss_dollars():
-
-    return (
-        state["daily_start_equity"]
-        * MAX_DAILY_LOSS_PCT
-        / 100
-    )
-
-
-# ============================================================
-# 12. COOLDOWN
-# ============================================================
-
-def cooldown_active():
-
-    value = state.get(
-        "cooldown_until"
-    )
-
+def parse_iso(value: str | None) -> datetime | None:
     if not value:
-        return False
+        return None
 
     try:
-
-        end = datetime.fromisoformat(value)
-
-        if now() < end:
-            return True
-
-    except:
-        pass
-
-    state["cooldown_until"] = None
-
-    return False
-
-
-def start_cooldown():
-
-    end = now() + timedelta(
-        minutes=COOLDOWN_MINUTES
-    )
-
-    state["cooldown_until"] = (
-        end.isoformat()
-    )
-
-    telegram_send(
-        "🧊 JARVIS COOLDOWN\n\n"
-        f"{state['consecutive_losses']} consecutive losses.\n"
-        f"New entries paused for "
-        f"{COOLDOWN_MINUTES} minutes.\n\n"
-        f"Cooldown ends:\n"
-        f"{end.strftime('%I:%M %p')}"
-    )
-
-    save_state()
-
-
-# ============================================================
-# 13. ENTRY PERMISSION
-# ============================================================
-
-def entry_allowed():
-
-    reset_day_if_needed()
-
-    if state["entries_paused"]:
-        return False, "manual pause"
-
-    if cooldown_active():
-        return False, "cooldown"
-
-    if (
-        state["consecutive_losses"]
-        >= MAX_CONSECUTIVE_LOSSES
-    ):
-
-        return False, "loss streak stop"
-
-    if (
-        state["daily_entries"]
-        >= MAX_DAILY_ENTRIES
-    ):
-
-        return False, "daily entry limit"
-
-    if (
-        len(state["positions"])
-        >= MAX_OPEN_POSITIONS
-    ):
-
-        return False, "position limit"
-
-    if (
-        daily_loss_pct()
-        >= MAX_DAILY_LOSS_PCT
-    ):
-
-        return False, "daily loss stop"
-
-    return True, "OK"
-
-
-# ============================================================
-# 14. POSITION SIZING
-# ============================================================
-
-def calculate_position_size(entry_price):
-
-    if entry_price <= 0:
-        return 0, 0
-
-    equity = get_equity()
-
-    risk_dollars = (
-        equity
-        * RISK_PER_TRADE_PCT
-        / 100
-    )
-
-    stop_fraction = (
-        STOP_LOSS_PCT / 100
-    )
-
-    position_value = (
-        risk_dollars
-        / stop_fraction
-    )
-
-    # Never use more than 10% of equity
-
-    max_position = equity * 0.10
-
-    position_value = min(
-        position_value,
-        max_position,
-        state["cash"]
-    )
-
-    quantity = (
-        position_value
-        / entry_price
-    )
-
-    return position_value, quantity
-
-
-def prospective_stop_loss(position_value):
-
-    return (
-        position_value
-        * STOP_LOSS_PCT
-        / 100
-    )
-
-
-def prospective_daily_loss_ok(
-    position_value
-):
-
-    current_loss = daily_loss_dollars()
-
-    possible_new_loss = (
-        prospective_stop_loss(
-            position_value
+        parsed = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
         )
-    )
+    except ValueError:
+        return None
 
-    maximum_loss = (
-        maximum_daily_loss_dollars()
-    )
-
-    if (
-        current_loss
-        + possible_new_loss
-        > maximum_loss
-    ):
-
-        return False
-
-    return True
-
-
-# ============================================================
-# 15. OPEN PAPER POSITION
-# ============================================================
-
-def open_position(data, score):
-
-    allowed, reason = entry_allowed()
-
-    if not allowed:
-        return False
-
-    token = data["token_address"]
-
-    if token in state["positions"]:
-        return False
-
-    price = data["price"]
-
-    position_value, quantity = (
-        calculate_position_size(price)
-    )
-
-    if position_value <= 0:
-        return False
-
-
-    # --------------------------------
-    # PRE-TRADE DAILY LOSS CHECK
-    # --------------------------------
-
-    if not prospective_daily_loss_ok(
-        position_value
-    ):
-
-        telegram_send(
-            "🛡️ JARVIS BLOCKED ENTRY\n\n"
-            f"{data['symbol']}\n\n"
-            "Reason: potential stop-loss "
-            "would exceed today's "
-            "maximum loss limit."
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(
+            tzinfo=timezone.utc
         )
 
+    return parsed.astimezone(timezone.utc)
+
+
+def money(value: float) -> str:
+    sign = "-" if value < 0 else ""
+    return f"{sign}${abs(value):,.2f}"
+
+
+def price(value: float) -> str:
+    if value >= 1:
+        return f"${value:,.4f}"
+    if value >= 0.01:
+        return f"${value:.6f}"
+    if value >= 0.000001:
+        return f"${value:.8f}"
+    return f"${value:.12g}"
+
+
+def percentage(value: float) -> str:
+    return f"{value:+.2f}%"
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+class ConfigurationError(ValueError):
+    pass
+
+
+def env_text(
+    env: Mapping[str, str],
+    name: str,
+    default: str = "",
+) -> str:
+    return str(env.get(name, default)).strip()
+
+
+def env_int(
+    env: Mapping[str, str],
+    name: str,
+    default: int,
+) -> int:
+    raw = env_text(env, name)
+
+    if not raw:
+        return default
+
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ConfigurationError(
+            f"{name} must be a whole number"
+        ) from exc
+
+
+def env_float(
+    env: Mapping[str, str],
+    name: str,
+    default: float,
+) -> float:
+    raw = env_text(env, name)
+
+    if not raw:
+        return default
+
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ConfigurationError(
+            f"{name} must be a number"
+        ) from exc
+
+
+def env_bool(
+    env: Mapping[str, str],
+    name: str,
+    default: bool,
+) -> bool:
+    raw = env_text(env, name)
+
+    if not raw:
+        return default
+
+    value = raw.lower()
+
+    if value in {"1", "true", "yes", "on"}:
+        return True
+
+    if value in {"0", "false", "no", "off"}:
         return False
 
-
-    state["cash"] -= position_value
-
-
-    stop_price = (
-        price
-        * (
-            1
-            - STOP_LOSS_PCT / 100
-        )
-    )
-
-    target_price = (
-        price
-        * (
-            1
-            + TAKE_PROFIT_PCT / 100
-        )
+    raise ConfigurationError(
+        f"{name} must be true or false"
     )
 
 
-    state["positions"][token] = {
+def parse_chat_ids(raw: str) -> frozenset[int]:
+    result: set[int] = set()
 
-        "token_address":
-            token,
+    for item in raw.split(","):
+        item = item.strip()
 
-        "symbol":
-            data["symbol"],
-
-        "name":
-            data["name"],
-
-        "entry_price":
-            price,
-
-        "current_price":
-            price,
-
-        "highest_price":
-            price,
-
-        "quantity":
-            quantity,
-
-        "position_value":
-            position_value,
-
-        "stop_price":
-            stop_price,
-
-        "target_price":
-            target_price,
-
-        "score":
-            score,
-
-        "opened_at":
-            timestamp_string(),
-
-        "liquidity":
-            data["liquidity"],
-
-        "volume24":
-            data["volume24"],
-
-        "market_cap":
-            data["market_cap"],
-
-        "change5":
-            data["change5"],
-
-        "change1":
-            data["change1"],
-
-        "change6":
-            data["change6"],
-
-        "buy_ratio":
-            data["buy_ratio"],
-
-        "url":
-            data["url"]
-    }
-
-
-    state["daily_entries"] += 1
-
-    save_state()
-
-
-    telegram_send(
-        "🧪 JARVIS PAPER ENTRY\n\n"
-        f"Token: {data['symbol']}\n"
-        f"Score: {score}/100\n\n"
-        f"Entry: ${price:.10f}\n"
-        f"Position: {money(position_value)}\n"
-        f"Risk: {RISK_PER_TRADE_PCT:.2f}%\n"
-        f"Stop: -{STOP_LOSS_PCT:.1f}%\n"
-        f"Target: +{TAKE_PROFIT_PCT:.1f}%\n\n"
-        f"Liquidity: "
-        f"{money(data['liquidity'])}\n"
-        f"24h Volume: "
-        f"{money(data['volume24'])}\n"
-        f"Market Cap: "
-        f"{money(data['market_cap'])}\n\n"
-        f"5m: {data['change5']:+.2f}%\n"
-        f"1h: {data['change1']:+.2f}%\n"
-        f"6h: {data['change6']:+.2f}%\n"
-        f"Buy ratio: "
-        f"{data['buy_ratio']*100:.1f}%\n\n"
-        "Mode: PAPER TRADING"
-    )
-
-    return True
-
-
-# ============================================================
-# 16. CLOSE POSITION
-# ============================================================
-
-def close_position(
-    token,
-    current_price,
-    reason
-):
-
-    pos = state["positions"].get(token)
-
-    if not pos:
-        return
-
-
-    exit_value = (
-        pos["quantity"]
-        * current_price
-    )
-
-    pnl = (
-        exit_value
-        - pos["position_value"]
-    )
-
-    pnl_pct = (
-        pnl
-        / pos["position_value"]
-        * 100
-    )
-
-
-    state["cash"] += exit_value
-
-    state["daily_realised_pnl"] += pnl
-
-
-    if pnl > 0:
-
-        state["wins"] += 1
-
-        state["consecutive_losses"] = 0
-
-        emoji = "✅"
-
-    else:
-
-        state["losses"] += 1
-
-        state["consecutive_losses"] += 1
-
-        emoji = "❌"
-
-
-    opened = datetime.fromisoformat(
-        pos["opened_at"]
-    )
-
-    duration_minutes = (
-        now() - opened
-    ).total_seconds() / 60
-
-
-    trade = {
-
-        "symbol":
-            pos["symbol"],
-
-        "token_address":
-            token,
-
-        "entry_price":
-            pos["entry_price"],
-
-        "exit_price":
-            current_price,
-
-        "position_value":
-            pos["position_value"],
-
-        "pnl":
-            pnl,
-
-        "pnl_pct":
-            pnl_pct,
-
-        "score":
-            pos["score"],
-
-        "entry_liquidity":
-            pos["liquidity"],
-
-        "entry_volume24":
-            pos["volume24"],
-
-        "entry_market_cap":
-            pos["market_cap"],
-
-        "entry_change5":
-            pos["change5"],
-
-        "entry_change1":
-            pos["change1"],
-
-        "entry_change6":
-            pos["change6"],
-
-        "entry_buy_ratio":
-            pos["buy_ratio"],
-
-        "opened_at":
-            pos["opened_at"],
-
-        "closed_at":
-            timestamp_string(),
-
-        "duration_minutes":
-            duration_minutes,
-
-        "exit_reason":
-            reason
-    }
-
-
-    state["closed_trades"].append(
-        trade
-    )
-
-    state["closed_trades"] = (
-        state["closed_trades"][-200:]
-    )
-
-
-    del state["positions"][token]
-
-
-    journal_trade(trade)
-
-    save_state()
-
-
-    telegram_send(
-        f"{emoji} JARVIS PAPER EXIT\n\n"
-        f"{pos['symbol']}\n\n"
-        f"Reason: {reason}\n"
-        f"P/L: {money(pnl)} "
-        f"({pnl_pct:+.2f}%)\n"
-        f"Held: {duration_minutes:.0f} min\n\n"
-        f"Loss streak: "
-        f"{state['consecutive_losses']}\n"
-        f"Daily loss: "
-        f"{daily_loss_pct():.2f}%/"
-        f"{MAX_DAILY_LOSS_PCT:.2f}%"
-    )
-
-
-    # --------------------------------
-    # COOLDOWN
-    # --------------------------------
-
-    if (
-        pnl < 0
-        and state["consecutive_losses"]
-        >= COOLDOWN_AFTER_LOSSES
-        and state["consecutive_losses"]
-        < MAX_CONSECUTIVE_LOSSES
-    ):
-
-        start_cooldown()
-
-
-    # --------------------------------
-    # HARD LOSS-STREAK STOP
-    # --------------------------------
-
-    if (
-        state["consecutive_losses"]
-        >= MAX_CONSECUTIVE_LOSSES
-    ):
-
-        telegram_send(
-            "🛑 JARVIS LOSS-STREAK STOP\n\n"
-            f"{MAX_CONSECUTIVE_LOSSES} "
-            "consecutive losses reached.\n\n"
-            "No more entries today unless "
-            "you manually reset the day.\n\n"
-            "Recommendation: review trades "
-            "instead of immediately resetting."
-        )
-
-
-# ============================================================
-# 17. POSITION MANAGEMENT
-# ============================================================
-
-def update_positions():
-
-    tokens = list(
-        state["positions"].keys()
-    )
-
-    for token in tokens:
+        if not item:
+            continue
 
         try:
+            result.add(int(item))
+        except ValueError as exc:
+            raise ConfigurationError(
+                "TELEGRAM_ALLOWED_CHAT_IDS must contain "
+                "comma-separated numbers"
+            ) from exc
 
-            pair = best_pair_for_token(
-                token
+    return frozenset(result)
+
+
+@dataclass(frozen=True, slots=True)
+class Settings:
+    telegram_bot_token: str
+    telegram_chat_id: int
+    allowed_chat_ids: frozenset[int]
+
+    timezone_name: str = "Australia/Sydney"
+    state_path: Path = Path("data/jarvis_state.json")
+    port: int = 8080
+
+    scan_interval_seconds: int = 30
+    price_update_seconds: int = 10
+    status_interval_seconds: int = 300
+    max_tokens_per_scan: int = 30
+    http_concurrency: int = 6
+    api_timeout_seconds: int = 12
+    rugcheck_cache_minutes: int = 30
+
+    starting_balance_usd: float = 1_000.0
+    risk_per_trade_pct: float = 0.50
+    max_position_pct: float = 10.0
+    max_open_positions: int = 2
+    max_daily_entries: int = 10
+    max_daily_loss_pct: float = 2.0
+    max_losing_streak: int = 3
+    trade_cooldown_minutes: int = 120
+
+    stop_loss_pct: float = 6.0
+    take_profit_pct: float = 15.0
+    trailing_activation_pct: float = 8.0
+    trailing_distance_pct: float = 5.0
+    max_hold_minutes: int = 360
+
+    momentum_exit_5m_pct: float = -3.0
+    momentum_exit_buy_ratio: float = 0.45
+    liquidity_exit_fraction: float = 0.50
+
+    paper_slippage_bps: float = 100.0
+    paper_fee_bps: float = 35.0
+
+    min_liquidity_usd: float = 50_000.0
+    min_volume_24h_usd: float = 100_000.0
+    min_market_cap_usd: float = 50_000.0
+    max_market_cap_usd: float = 5_000_000.0
+
+    min_pair_age_minutes: float = 10.0
+    max_pair_age_minutes: float = 43_200.0
+
+    min_5m_change_pct: float = 1.0
+    max_5m_change_pct: float = 25.0
+    min_1h_change_pct: float = -5.0
+    max_1h_change_pct: float = 100.0
+
+    min_5m_buys: int = 8
+    min_5m_buy_ratio: float = 0.58
+    min_liquidity_to_mcap: float = 0.03
+    max_volume_to_liquidity: float = 30.0
+    min_score: int = 76
+
+    rugcheck_required: bool = True
+    rugcheck_max_normalized: int = 60
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        env = os.environ
+
+        for name in (
+            "ENABLE_LIVE_TRADING",
+            "ENABLE_MAINNET_TRADING",
+            "LIVE_TRADING",
+        ):
+            if env_bool(env, name, False):
+                raise ConfigurationError(
+                    f"{name}=true is refused. "
+                    "This bot is paper-trading only."
+                )
+
+        for name in (
+            "SOLANA_PRIVATE_KEY",
+            "WALLET_PRIVATE_KEY",
+            "PHANTOM_PRIVATE_KEY",
+        ):
+            if env_text(env, name):
+                raise ConfigurationError(
+                    f"Remove {name}. No wallet key is "
+                    "allowed in this paper bot."
+                )
+
+        bot_token = env_text(
+            env,
+            "TELEGRAM_BOT_TOKEN",
+        )
+
+        chat_id = env_int(
+            env,
+            "TELEGRAM_CHAT_ID",
+            0,
+        )
+
+        if not bot_token:
+            raise ConfigurationError(
+                "TELEGRAM_BOT_TOKEN is required"
             )
 
-            if not pair:
-                continue
-
-            data = pair_market_data(pair)
-
-            price = data["price"]
-
-            if price <= 0:
-                continue
-
-            pos = state["positions"].get(
-                token
+        if not chat_id:
+            raise ConfigurationError(
+                "TELEGRAM_CHAT_ID is required"
             )
 
-            if not pos:
-                continue
+        allowed = parse_chat_ids(
+            env_text(
+                env,
+                "TELEGRAM_ALLOWED_CHAT_IDS",
+            )
+        )
 
-            pos["current_price"] = price
+        allowed = frozenset(
+            set(allowed) | {chat_id}
+        )
 
+        settings = cls(
+            telegram_bot_token=bot_token,
+            telegram_chat_id=chat_id,
+            allowed_chat_ids=allowed,
 
-            # --------------------------------
-            # Highest price
-            # --------------------------------
-
-            if (
-                price
-                > pos["highest_price"]
-            ):
-
-                pos["highest_price"] = price
-
-
-            pnl_pct = (
-                (
-                    price
-                    - pos["entry_price"]
+            timezone_name=env_text(
+                env,
+                "TIMEZONE",
+                "Australia/Sydney",
+            ),
+            state_path=Path(
+                env_text(
+                    env,
+                    "STATE_PATH",
+                    "data/jarvis_state.json",
                 )
-                / pos["entry_price"]
-                * 100
+            ),
+            port=env_int(env, "PORT", 8080),
+
+            scan_interval_seconds=env_int(
+                env,
+                "SCAN_INTERVAL_SECONDS",
+                30,
+            ),
+            price_update_seconds=env_int(
+                env,
+                "PRICE_UPDATE_SECONDS",
+                10,
+            ),
+            status_interval_seconds=env_int(
+                env,
+                "STATUS_INTERVAL_SECONDS",
+                300,
+            ),
+            max_tokens_per_scan=env_int(
+                env,
+                "MAX_TOKENS_PER_SCAN",
+                30,
+            ),
+            http_concurrency=env_int(
+                env,
+                "HTTP_CONCURRENCY",
+                6,
+            ),
+            api_timeout_seconds=env_int(
+                env,
+                "API_TIMEOUT_SECONDS",
+                12,
+            ),
+            rugcheck_cache_minutes=env_int(
+                env,
+                "RUGCHECK_CACHE_MINUTES",
+                30,
+            ),
+
+            starting_balance_usd=env_float(
+                env,
+                "STARTING_BALANCE_USD",
+                1_000,
+            ),
+            risk_per_trade_pct=env_float(
+                env,
+                "RISK_PER_TRADE_PCT",
+                0.50,
+            ),
+            max_position_pct=env_float(
+                env,
+                "MAX_POSITION_PCT",
+                10.0,
+            ),
+            max_open_positions=env_int(
+                env,
+                "MAX_OPEN_POSITIONS",
+                2,
+            ),
+            max_daily_entries=env_int(
+                env,
+                "MAX_DAILY_ENTRIES",
+                10,
+            ),
+            max_daily_loss_pct=env_float(
+                env,
+                "MAX_DAILY_LOSS_PCT",
+                2.0,
+            ),
+            max_losing_streak=env_int(
+                env,
+                "MAX_LOSING_STREAK",
+                3,
+            ),
+            trade_cooldown_minutes=env_int(
+                env,
+                "TRADE_COOLDOWN_MINUTES",
+                120,
+            ),
+
+            stop_loss_pct=env_float(
+                env,
+                "STOP_LOSS_PCT",
+                6.0,
+            ),
+            take_profit_pct=env_float(
+                env,
+                "TAKE_PROFIT_PCT",
+                15.0,
+            ),
+            trailing_activation_pct=env_float(
+                env,
+                "TRAILING_ACTIVATION_PCT",
+                8.0,
+            ),
+            trailing_distance_pct=env_float(
+                env,
+                "TRAILING_DISTANCE_PCT",
+                5.0,
+            ),
+            max_hold_minutes=env_int(
+                env,
+                "MAX_HOLD_MINUTES",
+                360,
+            ),
+
+            momentum_exit_5m_pct=env_float(
+                env,
+                "MOMENTUM_EXIT_5M_PCT",
+                -3.0,
+            ),
+            momentum_exit_buy_ratio=env_float(
+                env,
+                "MOMENTUM_EXIT_BUY_RATIO",
+                0.45,
+            ),
+            liquidity_exit_fraction=env_float(
+                env,
+                "LIQUIDITY_EXIT_FRACTION",
+                0.50,
+            ),
+
+            paper_slippage_bps=env_float(
+                env,
+                "PAPER_SLIPPAGE_BPS",
+                100.0,
+            ),
+            paper_fee_bps=env_float(
+                env,
+                "PAPER_FEE_BPS",
+                35.0,
+            ),
+
+            min_liquidity_usd=env_float(
+                env,
+                "MIN_LIQUIDITY_USD",
+                50_000,
+            ),
+            min_volume_24h_usd=env_float(
+                env,
+                "MIN_VOLUME_24H_USD",
+                100_000,
+            ),
+            min_market_cap_usd=env_float(
+                env,
+                "MIN_MARKET_CAP_USD",
+                50_000,
+            ),
+            max_market_cap_usd=env_float(
+                env,
+                "MAX_MARKET_CAP_USD",
+                5_000_000,
+            ),
+
+            min_pair_age_minutes=env_float(
+                env,
+                "MIN_PAIR_AGE_MINUTES",
+                10,
+            ),
+            max_pair_age_minutes=env_float(
+                env,
+                "MAX_PAIR_AGE_MINUTES",
+                43_200,
+            ),
+
+            min_5m_change_pct=env_float(
+                env,
+                "MIN_5M_CHANGE_PCT",
+                1.0,
+            ),
+            max_5m_change_pct=env_float(
+                env,
+                "MAX_5M_CHANGE_PCT",
+                25.0,
+            ),
+            min_1h_change_pct=env_float(
+                env,
+                "MIN_1H_CHANGE_PCT",
+                -5.0,
+            ),
+            max_1h_change_pct=env_float(
+                env,
+                "MAX_1H_CHANGE_PCT",
+                100.0,
+            ),
+
+            min_5m_buys=env_int(
+                env,
+                "MIN_5M_BUYS",
+                8,
+            ),
+            min_5m_buy_ratio=env_float(
+                env,
+                "MIN_5M_BUY_RATIO",
+                0.58,
+            ),
+            min_liquidity_to_mcap=env_float(
+                env,
+                "MIN_LIQUIDITY_TO_MCAP",
+                0.03,
+            ),
+            max_volume_to_liquidity=env_float(
+                env,
+                "MAX_VOLUME_TO_LIQUIDITY",
+                30.0,
+            ),
+            min_score=env_int(
+                env,
+                "MIN_SCORE",
+                76,
+            ),
+
+            rugcheck_required=env_bool(
+                env,
+                "RUGCHECK_REQUIRED",
+                True,
+            ),
+            rugcheck_max_normalized=env_int(
+                env,
+                "RUGCHECK_MAX_NORMALIZED",
+                60,
+            ),
+        )
+
+        settings.validate()
+        return settings
+
+    def validate(self) -> None:
+        if self.starting_balance_usd <= 0:
+            raise ConfigurationError(
+                "Starting balance must be positive"
+            )
+
+        if not (
+            0 < self.risk_per_trade_pct <= 100
+        ):
+            raise ConfigurationError(
+                "Risk per trade must be between 0 and 100"
+            )
+
+        if not (
+            0 < self.max_position_pct <= 100
+        ):
+            raise ConfigurationError(
+                "Maximum position must be between 0 and 100"
+            )
+
+        if not (
+            0 < self.stop_loss_pct
+            < self.take_profit_pct
+        ):
+            raise ConfigurationError(
+                "Stop must be positive and below target"
+            )
+
+        if not 0 <= self.min_score <= 100:
+            raise ConfigurationError(
+                "Minimum score must be between 0 and 100"
             )
 
 
-            # --------------------------------
-            # Stop loss
-            # --------------------------------
+# ============================================================
+# MARKET MODELS
+# ============================================================
 
-            if price <= pos["stop_price"]:
+@dataclass(slots=True)
+class MarketSnapshot:
+    token_address: str
+    symbol: str
+    name: str
+    pair_address: str
+    dex_id: str
+    quote_symbol: str
 
-                close_position(
-                    token,
-                    price,
-                    "STOP LOSS"
+    price_usd: float
+    liquidity_usd: float
+    volume_24h_usd: float
+    market_cap_usd: float
+    fdv_usd: float
+
+    change_5m_pct: float
+    change_1h_pct: float
+    change_6h_pct: float
+    change_24h_pct: float
+
+    buys_5m: int
+    sells_5m: int
+    buys_1h: int
+    sells_1h: int
+
+    age_minutes: float
+    pair_url: str
+    boosts_active: int = 0
+    sources: tuple[str, ...] = ()
+
+    @property
+    def buy_ratio_5m(self) -> float:
+        total = self.buys_5m + self.sells_5m
+
+        if total <= 0:
+            return 0.0
+
+        return self.buys_5m / total
+
+    @property
+    def liquidity_to_mcap(self) -> float:
+        market_cap = (
+            self.market_cap_usd
+            or self.fdv_usd
+        )
+
+        if market_cap <= 0:
+            return 0.0
+
+        return self.liquidity_usd / market_cap
+
+    @property
+    def volume_to_liquidity(self) -> float:
+        if self.liquidity_usd <= 0:
+            return 0.0
+
+        return (
+            self.volume_24h_usd
+            / self.liquidity_usd
+        )
+
+
+@dataclass(slots=True)
+class RugReport:
+    available: bool
+    normalized_score: int | None = None
+    raw_score: int | None = None
+    lp_locked_pct: float | None = None
+    danger_names: tuple[str, ...] = ()
+    warning_names: tuple[str, ...] = ()
+    error: str | None = None
+
+    @property
+    def has_danger(self) -> bool:
+        return bool(self.danger_names)
+
+
+@dataclass(slots=True)
+class Evaluation:
+    score: int
+    passed: bool
+    blocks: list[str] = field(
+        default_factory=list
+    )
+    reasons: list[str] = field(
+        default_factory=list
+    )
+    components: dict[str, int] = field(
+        default_factory=dict
+    )
+
+
+@dataclass(slots=True)
+class ExitDecision:
+    should_exit: bool
+    reason: str = ""
+    pnl_pct: float = 0.0
+
+
+# ============================================================
+# SAVED PAPER STATE
+# ============================================================
+
+STATE_VERSION = 2
+
+
+def create_new_state(
+    settings: Settings,
+    *,
+    day: str = "",
+) -> dict[str, Any]:
+    now = iso_now()
+
+    return {
+        "schema_version": STATE_VERSION,
+        "initial_balance":
+            settings.starting_balance_usd,
+        "cash":
+            settings.starting_balance_usd,
+
+        "positions": {},
+        "trades": [],
+
+        "manual_paused": False,
+        "safety_pause_reason": None,
+
+        "day": day,
+        "day_start_equity":
+            settings.starting_balance_usd,
+        "day_entries": 0,
+        "day_wins": 0,
+        "day_losses": 0,
+        "loss_streak": 0,
+
+        "cooldown_until": {},
+
+        "last_scan": {
+            "at": None,
+            "discovered": 0,
+            "snapshots": 0,
+            "market_passed": 0,
+            "qualified": 0,
+            "top_score": 0,
+            "top_blocks": [],
+        },
+
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+class StateStore:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.path = settings.state_path
+        self.lock = asyncio.Lock()
+
+    def load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return create_new_state(
+                self.settings
+            )
+
+        try:
+            state = json.loads(
+                self.path.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            if not isinstance(state, dict):
+                raise ValueError(
+                    "State is not a JSON object"
                 )
 
-                continue
+            baseline = create_new_state(
+                self.settings
+            )
 
+            baseline.update(state)
 
-            # --------------------------------
-            # Take profit
-            # --------------------------------
+            baseline.setdefault(
+                "positions",
+                {},
+            )
+            baseline.setdefault(
+                "trades",
+                [],
+            )
+            baseline.setdefault(
+                "cooldown_until",
+                {},
+            )
+            baseline.setdefault(
+                "last_scan",
+                create_new_state(
+                    self.settings
+                )["last_scan"],
+            )
 
-            if price >= pos["target_price"]:
+            baseline["schema_version"] = (
+                STATE_VERSION
+            )
 
-                close_position(
-                    token,
-                    price,
-                    "TAKE PROFIT"
+            return baseline
+
+        except (
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            backup_name = (
+                f"{self.path.name}.corrupt-"
+                f"{utc_now().strftime('%Y%m%dT%H%M%SZ')}"
+            )
+
+            try:
+                self.path.replace(
+                    self.path.with_name(backup_name)
                 )
+            except OSError:
+                pass
 
-                continue
+            return create_new_state(
+                self.settings
+            )
+
+    async def save(
+        self,
+        state: dict[str, Any],
+    ) -> None:
+        async with self.lock:
+            self.path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            state["updated_at"] = iso_now()
+            state["trades"] = list(
+                state.get("trades", [])
+            )[-2_000:]
+
+            content = json.dumps(
+                state,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+
+            temporary_path = (
+                self.path.with_suffix(
+                    self.path.suffix + ".tmp"
+                )
+            )
+
+            temporary_path.write_text(
+                content,
+                encoding="utf-8",
+            )
+
+            os.replace(
+                temporary_path,
+                self.path,
+            )
 
 
-            # --------------------------------
-            # Trailing stop
-            # --------------------------------
+# ============================================================
+# LIVE MARKET DATA
+# ============================================================
 
-            if (
-                pnl_pct
-                >= TRAILING_ACTIVATION_PCT
-            ):
+LOGGER = logging.getLogger("jarvis")
 
-                trailing_price = (
-                    pos["highest_price"]
-                    * (
-                        1
-                        - TRAILING_STOP_PCT
-                        / 100
+
+class APIError(RuntimeError):
+    pass
+
+
+class MarketDataClient:
+    DEX_BASE = "https://api.dexscreener.com"
+    RUG_BASE = "https://api.rugcheck.xyz"
+
+    ALLOWED_QUOTES = {
+        "SOL",
+        "WSOL",
+        "USDC",
+        "USDT",
+    }
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+        self.session: (
+            aiohttp.ClientSession | None
+        ) = None
+
+        self.semaphore = asyncio.Semaphore(
+            settings.http_concurrency
+        )
+
+        self.rug_cache: dict[
+            str,
+            tuple[float, RugReport],
+        ] = {}
+
+        self.request_count = 0
+        self.last_error: str | None = None
+
+    async def start(self) -> None:
+        if (
+            self.session
+            and not self.session.closed
+        ):
+            return
+
+        timeout = aiohttp.ClientTimeout(
+            total=(
+                self.settings
+                .api_timeout_seconds
+            )
+        )
+
+        self.session = aiohttp.ClientSession(
+            timeout=timeout,
+            headers={
+                "User-Agent":
+                    "JarvisV2-PaperResearch/2.1"
+            },
+        )
+
+    async def close(self) -> None:
+        if (
+            self.session
+            and not self.session.closed
+        ):
+            await self.session.close()
+
+    async def get_json(
+        self,
+        url: str,
+        *,
+        attempts: int = 3,
+    ) -> Any:
+        await self.start()
+        assert self.session is not None
+
+        last_error: Exception | None = None
+
+        for attempt in range(attempts):
+            try:
+                async with self.semaphore:
+                    self.request_count += 1
+
+                    async with self.session.get(
+                        url
+                    ) as response:
+                        if response.status == 429:
+                            retry_after = safe_float(
+                                response.headers.get(
+                                    "Retry-After"
+                                ),
+                                1.0,
+                            )
+
+                            await asyncio.sleep(
+                                min(
+                                    8.0,
+                                    max(
+                                        0.5,
+                                        retry_after,
+                                    ),
+                                )
+                            )
+                            continue
+
+                        if response.status >= 500:
+                            raise APIError(
+                                "Market service returned "
+                                f"HTTP {response.status}"
+                            )
+
+                        if response.status >= 400:
+                            body = (
+                                await response.text()
+                            )[:200]
+
+                            raise APIError(
+                                f"HTTP {response.status}: "
+                                f"{body}"
+                            )
+
+                        return await response.json(
+                            content_type=None
+                        )
+
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                APIError,
+            ) as exc:
+                last_error = exc
+
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(
+                        0.75 * (2 ** attempt)
                     )
+
+        self.last_error = str(
+            last_error
+            or "Unknown market API error"
+        )
+
+        raise APIError(self.last_error)
+
+    async def discover_tokens(
+        self,
+    ) -> list[tuple[str, tuple[str, ...]]]:
+        endpoints = (
+            (
+                f"{self.DEX_BASE}/token-profiles/latest/v1",
+                "DexScreener profiles",
+            ),
+            (
+                f"{self.DEX_BASE}/token-boosts/top/v1",
+                "DexScreener top boosts",
+            ),
+            (
+                f"{self.DEX_BASE}/token-boosts/latest/v1",
+                "DexScreener latest boosts",
+            ),
+            (
+                f"{self.RUG_BASE}/v1/stats/new_tokens",
+                "RugCheck new",
+            ),
+            (
+                f"{self.RUG_BASE}/v1/stats/trending",
+                "RugCheck trending",
+            ),
+        )
+
+        results = await asyncio.gather(
+            *(
+                self.get_json(
+                    endpoint,
+                    attempts=2,
+                )
+                for endpoint, _ in endpoints
+            ),
+            return_exceptions=True,
+        )
+
+        source_buckets: list[
+            tuple[str, list[str]]
+        ] = []
+
+        for result, endpoint_info in zip(
+            results,
+            endpoints,
+            strict=True,
+        ):
+            source = endpoint_info[1]
+
+            if isinstance(result, Exception):
+                LOGGER.warning(
+                    "Discovery source unavailable: "
+                    "%s — %s",
+                    source,
+                    result,
+                )
+                continue
+
+            if isinstance(result, list):
+                items = result
+            elif isinstance(result, dict):
+                items = result.get(
+                    "tokens",
+                    [],
+                )
+            else:
+                items = []
+
+            addresses: list[str] = []
+            source_seen: set[str] = set()
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+
+                chain = str(
+                    item.get(
+                        "chainId",
+                        "solana",
+                    )
+                ).lower()
+
+                if chain != "solana":
+                    continue
+
+                address = (
+                    item.get("tokenAddress")
+                    or item.get("mint")
+                    or item.get("address")
+                )
+
+                if not isinstance(address, str):
+                    continue
+
+                address = address.strip()
+
+                if (
+                    not address
+                    or address in source_seen
+                ):
+                    continue
+
+                source_seen.add(address)
+                addresses.append(address)
+
+            source_buckets.append(
+                (
+                    source,
+                    addresses,
+                )
+            )
+
+        discovered_sources: dict[
+            str,
+            set[str],
+        ] = {}
+
+        ordered_addresses: list[str] = []
+
+        largest_bucket = max(
+            (
+                len(addresses)
+                for _, addresses
+                in source_buckets
+            ),
+            default=0,
+        )
+
+        scan_cap = (
+            self.settings.max_tokens_per_scan
+        )
+
+        for index in range(largest_bucket):
+            for source, addresses in source_buckets:
+                if index >= len(addresses):
+                    continue
+
+                address = addresses[index]
+
+                if address not in discovered_sources:
+                    discovered_sources[address] = set()
+                    ordered_addresses.append(address)
+
+                discovered_sources[address].add(
+                    source
                 )
 
                 if (
-                    price
-                    <= trailing_price
+                    len(ordered_addresses)
+                    >= scan_cap
                 ):
+                    return [
+                        (
+                            token_address,
+                            tuple(
+                                sorted(
+                                    discovered_sources[
+                                        token_address
+                                    ]
+                                )
+                            ),
+                        )
+                        for token_address
+                        in ordered_addresses
+                    ]
 
-                    close_position(
-                        token,
-                        price,
-                        "TRAILING STOP"
+        return [
+            (
+                token_address,
+                tuple(
+                    sorted(
+                        discovered_sources[
+                            token_address
+                        ]
                     )
+                ),
+            )
+            for token_address
+            in ordered_addresses
+        ]
 
-                    continue
+    async def fetch_snapshot(
+        self,
+        token_address: str,
+        sources: Iterable[str] = (),
+        *,
+        preferred_pair: str | None = None,
+    ) -> MarketSnapshot | None:
+        encoded = quote(
+            token_address,
+            safe="",
+        )
 
+        payload = await self.get_json(
+            f"{self.DEX_BASE}/token-pairs/v1/"
+            f"solana/{encoded}"
+        )
 
-            # --------------------------------
-            # Maximum hold time
-            # --------------------------------
+        if not isinstance(payload, list):
+            return None
 
-            opened = datetime.fromisoformat(
-                pos["opened_at"]
+        valid_pairs: list[
+            dict[str, Any]
+        ] = []
+
+        for pair in payload:
+            if not isinstance(pair, dict):
+                continue
+
+            if pair.get("chainId") != "solana":
+                continue
+
+            base_token = (
+                pair.get("baseToken") or {}
             )
 
-            minutes_open = (
-                now() - opened
-            ).total_seconds() / 60
+            quote_token = (
+                pair.get("quoteToken") or {}
+            )
 
             if (
-                minutes_open
-                >= MAX_HOLD_MINUTES
+                base_token.get("address")
+                != token_address
             ):
-
-                close_position(
-                    token,
-                    price,
-                    "TIME EXIT"
-                )
-
                 continue
 
+            quote_symbol = str(
+                quote_token.get("symbol", "")
+            ).upper()
 
-        except Exception as e:
+            if (
+                quote_symbol
+                not in self.ALLOWED_QUOTES
+            ):
+                continue
 
-            print(
-                "Position update error:",
-                e
+            if safe_float(
+                pair.get("priceUsd")
+            ) <= 0:
+                continue
+
+            valid_pairs.append(pair)
+
+        if not valid_pairs:
+            return None
+
+        selected: dict[str, Any] | None = None
+
+        if preferred_pair:
+            selected = next(
+                (
+                    pair
+                    for pair in valid_pairs
+                    if pair.get("pairAddress")
+                    == preferred_pair
+                ),
+                None,
             )
 
+        if selected is None:
+            selected = max(
+                valid_pairs,
+                key=lambda pair: safe_float(
+                    (
+                        pair.get("liquidity")
+                        or {}
+                    ).get("usd")
+                ),
+            )
 
-    save_state()
+        now_ms = time.time() * 1_000
 
+        created_ms = safe_float(
+            selected.get("pairCreatedAt"),
+            now_ms,
+        )
 
-# ============================================================
-# 18. SCANNER
-# ============================================================
+        age_minutes = max(
+            0.0,
+            (now_ms - created_ms) / 60_000,
+        )
 
-def scan_market():
+        base_token = (
+            selected.get("baseToken") or {}
+        )
+        quote_token = (
+            selected.get("quoteToken") or {}
+        )
+        transactions = (
+            selected.get("txns") or {}
+        )
+        changes = (
+            selected.get("priceChange") or {}
+        )
+        volume = (
+            selected.get("volume") or {}
+        )
+        liquidity = (
+            selected.get("liquidity") or {}
+        )
+        boosts = (
+            selected.get("boosts") or {}
+        )
 
-    allowed, reason = entry_allowed()
+        five_minute_transactions = (
+            transactions.get("m5") or {}
+        )
 
-    if not allowed:
-        return
+        one_hour_transactions = (
+            transactions.get("h1") or {}
+        )
 
+        pair_address = str(
+            selected.get("pairAddress") or ""
+        )
 
-    addresses = get_latest_profiles()
+        return MarketSnapshot(
+            token_address=token_address,
 
-    if not addresses:
-        return
+            symbol=str(
+                base_token.get("symbol")
+                or "UNKNOWN"
+            )[:30],
 
+            name=str(
+                base_token.get("name")
+                or base_token.get("symbol")
+                or "Unknown"
+            )[:80],
 
-    state["total_scans"] += 1
+            pair_address=pair_address,
 
-    candidates = []
+            dex_id=str(
+                selected.get("dexId")
+                or "unknown"
+            ),
 
+            quote_symbol=str(
+                quote_token.get("symbol")
+                or ""
+            ).upper(),
 
-    for address in addresses:
+            price_usd=safe_float(
+                selected.get("priceUsd")
+            ),
+
+            liquidity_usd=safe_float(
+                liquidity.get("usd")
+            ),
+
+            volume_24h_usd=safe_float(
+                volume.get("h24")
+            ),
+
+            market_cap_usd=safe_float(
+                selected.get("marketCap")
+            ),
+
+            fdv_usd=safe_float(
+                selected.get("fdv")
+            ),
+
+            change_5m_pct=safe_float(
+                changes.get("m5")
+            ),
+
+            change_1h_pct=safe_float(
+                changes.get("h1")
+            ),
+
+            change_6h_pct=safe_float(
+                changes.get("h6")
+            ),
+
+            change_24h_pct=safe_float(
+                changes.get("h24")
+            ),
+
+            buys_5m=safe_int(
+                five_minute_transactions.get(
+                    "buys"
+                )
+            ),
+
+            sells_5m=safe_int(
+                five_minute_transactions.get(
+                    "sells"
+                )
+            ),
+
+            buys_1h=safe_int(
+                one_hour_transactions.get(
+                    "buys"
+                )
+            ),
+
+            sells_1h=safe_int(
+                one_hour_transactions.get(
+                    "sells"
+                )
+            ),
+
+            age_minutes=age_minutes,
+
+            pair_url=str(
+                selected.get("url")
+                or (
+                    "https://dexscreener.com/"
+                    f"solana/{pair_address}"
+                )
+            ),
+
+            boosts_active=safe_int(
+                boosts.get("active")
+            ),
+
+            sources=tuple(sources),
+        )
+
+    async def fetch_many_snapshots(
+        self,
+        discoveries: Iterable[
+            tuple[str, tuple[str, ...]]
+        ],
+    ) -> list[MarketSnapshot]:
+        results = await asyncio.gather(
+            *(
+                self.fetch_snapshot(
+                    address,
+                    sources,
+                )
+                for address, sources
+                in discoveries
+            ),
+            return_exceptions=True,
+        )
+
+        snapshots: list[MarketSnapshot] = []
+
+        for result in results:
+            if isinstance(
+                result,
+                MarketSnapshot,
+            ):
+                snapshots.append(result)
+
+            elif isinstance(result, Exception):
+                LOGGER.debug(
+                    "Snapshot failed: %s",
+                    result,
+                )
+
+        return snapshots
+
+    async def fetch_rug_report(
+        self,
+        token_address: str,
+        *,
+        force: bool = False,
+    ) -> RugReport:
+        cached = self.rug_cache.get(
+            token_address
+        )
+
+        cache_seconds = (
+            self.settings.rugcheck_cache_minutes
+            * 60
+        )
+
+        if (
+            not force
+            and cached
+            and (
+                time.monotonic()
+                - cached[0]
+                < cache_seconds
+            )
+        ):
+            return cached[1]
+
+        encoded = quote(
+            token_address,
+            safe="",
+        )
+
+        url = (
+            f"{self.RUG_BASE}/v1/tokens/"
+            f"{encoded}/report/summary"
+            "?cacheOnly=false"
+        )
 
         try:
-
-            if address in state["positions"]:
-                continue
-
-            pair = best_pair_for_token(
-                address
+            payload = await self.get_json(
+                url,
+                attempts=2,
             )
 
-            if not pair:
+        except APIError as exc:
+            report = RugReport(
+                available=False,
+                error=str(exc),
+            )
+
+            self.rug_cache[token_address] = (
+                time.monotonic(),
+                report,
+            )
+
+            return report
+
+        if (
+            not isinstance(payload, dict)
+            or payload.get("error")
+        ):
+            error = (
+                str(
+                    payload.get(
+                        "error",
+                        "Invalid RugCheck response",
+                    )
+                )
+                if isinstance(payload, dict)
+                else "Invalid RugCheck response"
+            )
+
+            report = RugReport(
+                available=False,
+                error=error,
+            )
+
+            self.rug_cache[token_address] = (
+                time.monotonic(),
+                report,
+            )
+
+            return report
+
+        dangers: list[str] = []
+        warnings: list[str] = []
+
+        for risk in payload.get("risks") or []:
+            if not isinstance(risk, dict):
                 continue
 
-            data = pair_market_data(pair)
+            name = str(
+                risk.get("name")
+                or risk.get("description")
+                or "Unnamed risk"
+            )
 
-            state["candidates_seen"] += 1
+            level = str(
+                risk.get("level") or ""
+            ).lower()
 
-            reason = reject_reason(data)
+            if (
+                level in {"danger", "critical"}
+                or "honeypot" in name.lower()
+            ):
+                dangers.append(name)
+            else:
+                warnings.append(name)
 
-            if reason:
+        normalized = payload.get(
+            "score_normalised"
+        )
 
-                state[
-                    "candidates_rejected"
-                ] += 1
+        raw_score = payload.get("score")
+        lp_locked = payload.get("lpLockedPct")
 
-                continue
+        report = RugReport(
+            available=True,
+
+            normalized_score=(
+                safe_int(normalized)
+                if normalized is not None
+                else None
+            ),
+
+            raw_score=(
+                safe_int(raw_score)
+                if raw_score is not None
+                else None
+            ),
+
+            lp_locked_pct=(
+                safe_float(lp_locked)
+                if lp_locked is not None
+                else None
+            ),
+
+            danger_names=tuple(dangers),
+            warning_names=tuple(warnings),
+        )
+
+        self.rug_cache[token_address] = (
+            time.monotonic(),
+            report,
+        )
+
+        return report
 
 
-            score = calculate_score(data)
+# ============================================================
+# STRICT SCORING STRATEGY
+# ============================================================
 
-            if score < MIN_SCORE:
+class Strategy:
+    def __init__(self, settings: Settings):
+        self.settings = settings
 
-                state[
-                    "candidates_rejected"
-                ] += 1
+    def market_blocks(
+        self,
+        snapshot: MarketSnapshot,
+    ) -> list[str]:
+        settings = self.settings
 
-                continue
+        market_cap = (
+            snapshot.market_cap_usd
+            or snapshot.fdv_usd
+        )
 
+        blocks: list[str] = []
 
-            state["candidates_passed"] += 1
+        if snapshot.price_usd <= 0:
+            blocks.append("invalid price")
 
-            candidates.append(
-                (
-                    score,
-                    data
+        if (
+            snapshot.liquidity_usd
+            < settings.min_liquidity_usd
+        ):
+            blocks.append(
+                "liquidity below "
+                f"${settings.min_liquidity_usd:,.0f}"
+            )
+
+        if (
+            snapshot.volume_24h_usd
+            < settings.min_volume_24h_usd
+        ):
+            blocks.append(
+                "24h volume below "
+                f"${settings.min_volume_24h_usd:,.0f}"
+            )
+
+        if market_cap <= 0:
+            blocks.append(
+                "market cap unavailable"
+            )
+
+        elif not (
+            settings.min_market_cap_usd
+            <= market_cap
+            <= settings.max_market_cap_usd
+        ):
+            blocks.append(
+                "market cap outside range"
+            )
+
+        if not (
+            settings.min_pair_age_minutes
+            <= snapshot.age_minutes
+            <= settings.max_pair_age_minutes
+        ):
+            blocks.append(
+                "pair age outside range"
+            )
+
+        if not (
+            settings.min_5m_change_pct
+            <= snapshot.change_5m_pct
+            <= settings.max_5m_change_pct
+        ):
+            blocks.append(
+                "5m momentum outside range"
+            )
+
+        if not (
+            settings.min_1h_change_pct
+            <= snapshot.change_1h_pct
+            <= settings.max_1h_change_pct
+        ):
+            blocks.append(
+                "1h trend outside range"
+            )
+
+        if (
+            snapshot.buys_5m
+            < settings.min_5m_buys
+        ):
+            blocks.append(
+                "not enough 5m buys"
+            )
+
+        if (
+            snapshot.buy_ratio_5m
+            < settings.min_5m_buy_ratio
+        ):
+            blocks.append(
+                "5m buy ratio too weak"
+            )
+
+        if (
+            snapshot.liquidity_to_mcap
+            < settings.min_liquidity_to_mcap
+        ):
+            blocks.append(
+                "liquidity/mcap too low"
+            )
+
+        if (
+            snapshot.volume_to_liquidity
+            > settings.max_volume_to_liquidity
+        ):
+            blocks.append(
+                "suspicious volume/liquidity"
+            )
+
+        return blocks
+
+    def evaluate(
+        self,
+        snapshot: MarketSnapshot,
+        rug_report: RugReport,
+    ) -> Evaluation:
+        blocks = self.market_blocks(snapshot)
+
+        if (
+            not rug_report.available
+            and self.settings.rugcheck_required
+        ):
+            blocks.append(
+                "RugCheck unavailable"
+            )
+
+        if rug_report.has_danger:
+            blocks.append(
+                "RugCheck danger: "
+                + ", ".join(
+                    rug_report.danger_names[:2]
                 )
             )
 
+        if (
+            rug_report.normalized_score
+            is not None
+            and rug_report.normalized_score
+            > self.settings
+            .rugcheck_max_normalized
+        ):
+            blocks.append(
+                "RugCheck risk "
+                f"{rug_report.normalized_score}/100"
+            )
 
-            time.sleep(0.20)
+        components = {
+            "liquidity":
+                self.liquidity_score(snapshot),
 
+            "volume":
+                self.volume_score(snapshot),
 
-        except:
-            continue
+            "momentum":
+                self.momentum_score(snapshot),
 
+            "trend":
+                self.trend_score(snapshot),
 
-    candidates.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
+            "buy pressure":
+                self.buy_pressure_score(snapshot),
 
+            "liquidity quality":
+                self.liquidity_quality_score(
+                    snapshot
+                ),
 
-    # Only take best available setup
+            "age":
+                self.age_score(snapshot),
 
-    for score, data in candidates:
+            "rug safety":
+                self.rug_score(rug_report),
+        }
 
-        allowed, reason = entry_allowed()
-
-        if not allowed:
-            break
-
-        opened = open_position(
-            data,
-            score
+        score = max(
+            0,
+            min(
+                100,
+                sum(components.values()),
+            ),
         )
 
-        if opened:
-            break
+        if (
+            not blocks
+            and score < self.settings.min_score
+        ):
+            blocks.append(
+                f"score {score}/100 below "
+                f"{self.settings.min_score}"
+            )
 
+        reasons = [
+            name
+            for name, points in sorted(
+                components.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:3]
+            if points > 0
+        ]
 
-    state["last_scan"] = (
-        timestamp_string()
-    )
-
-    save_state()
-
-
-# ============================================================
-# 19. DAILY RESET
-# ============================================================
-
-def reset_day_if_needed():
-
-    current = today_string()
-
-    if state["date"] == current:
-        return
-
-
-    equity = get_equity()
-
-    state["date"] = current
-
-    state["daily_start_equity"] = equity
-
-    state["daily_realised_pnl"] = 0
-
-    state["daily_entries"] = 0
-
-    state["wins"] = 0
-
-    state["losses"] = 0
-
-    state["consecutive_losses"] = 0
-
-    state["cooldown_until"] = None
-
-    state["entries_paused"] = False
-
-
-    save_state()
-
-
-    telegram_send(
-        "🌅 JARVIS NEW DAY RESET\n\n"
-        f"Date: {current}\n"
-        f"Starting equity: "
-        f"{money(equity)}\n\n"
-        "Daily counters reset.\n"
-        "Paper positions remain managed."
-    )
-
-
-def manual_reset_day():
-
-    equity = get_equity()
-
-    state["date"] = today_string()
-
-    state["daily_start_equity"] = equity
-
-    state["daily_realised_pnl"] = 0
-
-    state["daily_entries"] = 0
-
-    state["wins"] = 0
-
-    state["losses"] = 0
-
-    state["consecutive_losses"] = 0
-
-    state["cooldown_until"] = None
-
-    state["entries_paused"] = False
-
-    save_state()
-
-
-    telegram_send(
-        "🔄 JARVIS DAY RESET\n\n"
-        f"New starting equity: "
-        f"{money(equity)}\n\n"
-        "Daily counters cleared.\n\n"
-        "⚠️ This does not recover losses."
-    )
-
-
-# ============================================================
-# 20. STATUS
-# ============================================================
-
-def status_message():
-
-    equity = get_equity()
-
-    pnl = (
-        equity
-        - STARTING_BALANCE
-    )
-
-    total_closed = (
-        state["wins"]
-        + state["losses"]
-    )
-
-    if total_closed:
-
-        win_rate = (
-            state["wins"]
-            / total_closed
-            * 100
+        reasons.append(
+            "5m buy ratio "
+            f"{snapshot.buy_ratio_5m:.0%}"
         )
 
-    else:
-        win_rate = 0
+        return Evaluation(
+            score=score,
+            passed=(
+                not blocks
+                and score
+                >= self.settings.min_score
+            ),
+            blocks=blocks,
+            reasons=reasons[:4],
+            components=components,
+        )
+
+    @staticmethod
+    def liquidity_score(
+        snapshot: MarketSnapshot,
+    ) -> int:
+        value = snapshot.liquidity_usd
+
+        if value >= 500_000:
+            return 15
+        if value >= 250_000:
+            return 14
+        if value >= 100_000:
+            return 11
+        if value >= 50_000:
+            return 8
+        return 0
+
+    @staticmethod
+    def volume_score(
+        snapshot: MarketSnapshot,
+    ) -> int:
+        value = snapshot.volume_24h_usd
+
+        if value >= 2_000_000:
+            return 15
+        if value >= 1_000_000:
+            return 14
+        if value >= 500_000:
+            return 12
+        if value >= 250_000:
+            return 9
+        if value >= 100_000:
+            return 6
+        return 0
+
+    @staticmethod
+    def momentum_score(
+        snapshot: MarketSnapshot,
+    ) -> int:
+        value = snapshot.change_5m_pct
+
+        if 2 <= value <= 8:
+            return 15
+        if 1 <= value <= 15:
+            return 12
+        if 0 <= value <= 25:
+            return 8
+        return 0
+
+    @staticmethod
+    def trend_score(
+        snapshot: MarketSnapshot,
+    ) -> int:
+        value = snapshot.change_1h_pct
+
+        if 5 <= value <= 35:
+            return 10
+        if 0 <= value <= 60:
+            return 8
+        if -5 <= value <= 100:
+            return 4
+        return 0
+
+    @staticmethod
+    def buy_pressure_score(
+        snapshot: MarketSnapshot,
+    ) -> int:
+        ratio = snapshot.buy_ratio_5m
+
+        if ratio >= 0.72:
+            base = 12
+        elif ratio >= 0.65:
+            base = 10
+        elif ratio >= 0.58:
+            base = 7
+        else:
+            base = 0
+
+        if snapshot.buys_5m >= 25:
+            activity = 3
+        elif snapshot.buys_5m >= 15:
+            activity = 2
+        else:
+            activity = 1
+
+        return min(15, base + activity)
+
+    @staticmethod
+    def liquidity_quality_score(
+        snapshot: MarketSnapshot,
+    ) -> int:
+        ratio = snapshot.liquidity_to_mcap
+
+        if ratio >= 0.20:
+            return 10
+        if ratio >= 0.12:
+            return 9
+        if ratio >= 0.08:
+            return 7
+        if ratio >= 0.05:
+            return 5
+        if ratio >= 0.03:
+            return 3
+        return 0
+
+    @staticmethod
+    def age_score(
+        snapshot: MarketSnapshot,
+    ) -> int:
+        age = snapshot.age_minutes
+
+        if 15 <= age <= 1_440:
+            return 5
+        if 10 <= age <= 10_080:
+            return 4
+        if age <= 43_200:
+            return 2
+        return 0
+
+    @staticmethod
+    def rug_score(
+        rug_report: RugReport,
+    ) -> int:
+        if (
+            not rug_report.available
+            or rug_report.has_danger
+        ):
+            return 0
+
+        value = rug_report.normalized_score
+
+        if value is None:
+            score = 6
+        elif value <= 10:
+            score = 15
+        elif value <= 20:
+            score = 13
+        elif value <= 40:
+            score = 10
+        elif value <= 60:
+            score = 5
+        else:
+            score = 0
+
+        if len(rug_report.warning_names) >= 4:
+            score = max(0, score - 2)
+
+        return score
 
 
-    allowed, reason = entry_allowed()
+# ============================================================
+# PAPER BROKER
+# ============================================================
 
-
-    if daily_loss_pct() >= MAX_DAILY_LOSS_PCT:
-
-        status = "🛑 DAILY LOSS STOP"
-
-    elif (
-        state["consecutive_losses"]
-        >= MAX_CONSECUTIVE_LOSSES
+class PaperBroker:
+    def __init__(
+        self,
+        settings: Settings,
+        store: StateStore,
     ):
+        self.settings = settings
+        self.store = store
+        self.state = store.load()
 
-        status = "🛑 LOSS STREAK STOP"
-
-    elif cooldown_active():
-
-        status = "🧊 COOLDOWN"
-
-    elif state["entries_paused"]:
-
-        status = "⏸ PAUSED"
-
-    else:
-
-        status = "🟢 RESEARCHING"
-
-
-    return (
-        "🤖 JARVIS RESEARCH STATUS\n\n"
-
-        f"Cash: {money(state['cash'])}\n"
-        f"Equity: {money(equity)}\n"
-        f"Total P/L: {money(pnl)}\n"
-        f"Open P/L: "
-        f"{money(open_pnl())}\n\n"
-
-        f"Today's wins: "
-        f"{state['wins']}\n"
-        f"Today's losses: "
-        f"{state['losses']}\n"
-        f"Win rate: "
-        f"{win_rate:.1f}%\n\n"
-
-        f"Open positions: "
-        f"{len(state['positions'])}/"
-        f"{MAX_OPEN_POSITIONS}\n"
-
-        f"Entries: "
-        f"{state['daily_entries']}/"
-        f"{MAX_DAILY_ENTRIES}\n"
-
-        f"Loss streak: "
-        f"{state['consecutive_losses']}/"
-        f"{MAX_CONSECUTIVE_LOSSES}\n"
-
-        f"Daily loss: "
-        f"{daily_loss_pct():.2f}%/"
-        f"{MAX_DAILY_LOSS_PCT:.2f}%\n\n"
-
-        f"Risk/trade: "
-        f"{RISK_PER_TRADE_PCT:.2f}%\n"
-        f"Stop: {STOP_LOSS_PCT:.1f}%\n"
-        f"Target: +"
-        f"{TAKE_PROFIT_PCT:.1f}%\n"
-        f"Minimum score: "
-        f"{MIN_SCORE}/100\n\n"
-
-        f"Status: {status}\n"
-        "Mode: 🧪 PAPER TRADING"
-    )
-
-
-# ============================================================
-# 21. POSITIONS MESSAGE
-# ============================================================
-
-def positions_message():
-
-    if not state["positions"]:
-
-        return (
-            "📭 JARVIS POSITIONS\n\n"
-            "No open positions."
+        self.timezone = ZoneInfo(
+            settings.timezone_name
         )
 
+    def local_day(self) -> str:
+        return (
+            utc_now()
+            .astimezone(self.timezone)
+            .date()
+            .isoformat()
+        )
 
-    text = "📊 JARVIS POSITIONS\n\n"
+    async def ensure_day(self) -> bool:
+        today = self.local_day()
 
+        if self.state.get("day") == today:
+            return False
 
-    for pos in state[
-        "positions"
-    ].values():
+        self.state["day"] = today
+        self.state["day_start_equity"] = (
+            self.equity()
+        )
+        self.state["day_entries"] = 0
+        self.state["day_wins"] = 0
+        self.state["day_losses"] = 0
+        self.state["loss_streak"] = 0
+        self.state["safety_pause_reason"] = None
 
-        current = pos.get(
-            "current_price",
-            pos["entry_price"]
+        await self.store.save(self.state)
+        return True
+
+    @property
+    def cash(self) -> float:
+        return float(
+            self.state.get("cash", 0)
+        )
+
+    @property
+    def positions(
+        self,
+    ) -> dict[str, dict[str, Any]]:
+        return self.state.setdefault(
+            "positions",
+            {},
+        )
+
+    def estimated_exit_value(
+        self,
+        position: dict[str, Any],
+    ) -> float:
+        current_price = float(
+            position.get("last_market_price")
+            or position.get("entry_market_price")
+            or 0
+        )
+
+        quantity = float(
+            position.get("quantity", 0)
+        )
+
+        slippage = (
+            self.settings.paper_slippage_bps
+            / 10_000
+        )
+
+        fee = (
+            self.settings.paper_fee_bps
+            / 10_000
+        )
+
+        gross = (
+            quantity
+            * current_price
+            * (1 - slippage)
+        )
+
+        return max(
+            0,
+            gross * (1 - fee),
+        )
+
+    def equity(self) -> float:
+        return self.cash + sum(
+            self.estimated_exit_value(
+                position
+            )
+            for position
+            in self.positions.values()
+        )
+
+    def open_pnl(self) -> float:
+        return sum(
+            self.estimated_exit_value(position)
+            - float(
+                position.get(
+                    "entry_total_cost",
+                    0,
+                )
+            )
+            for position
+            in self.positions.values()
+        )
+
+    def total_realized_pnl(self) -> float:
+        return sum(
+            float(trade.get("pnl_usd", 0))
+            for trade
+            in self.state.get("trades", [])
+        )
+
+    def today_pnl(self) -> float:
+        return (
+            self.equity()
+            - float(
+                self.state.get(
+                    "day_start_equity",
+                    self.equity(),
+                )
+            )
+        )
+
+    def daily_loss_pct(self) -> float:
+        starting_equity = float(
+            self.state.get(
+                "day_start_equity",
+                0,
+            )
+        )
+
+        if starting_equity <= 0:
+            return 0.0
+
+        return max(
+            0.0,
+            (
+                starting_equity
+                - self.equity()
+            )
+            / starting_equity
+            * 100,
+        )
+
+    def entry_guard(
+        self,
+        token_address: str | None = None,
+    ) -> str | None:
+        if self.state.get("manual_paused"):
+            return "manually paused"
+
+        if self.state.get(
+            "safety_pause_reason"
+        ):
+            return str(
+                self.state[
+                    "safety_pause_reason"
+                ]
+            )
+
+        if (
+            len(self.positions)
+            >= self.settings.max_open_positions
+        ):
+            return (
+                "maximum open positions reached"
+            )
+
+        if (
+            safe_int(
+                self.state.get("day_entries")
+            )
+            >= self.settings.max_daily_entries
+        ):
+            return "daily entry limit reached"
+
+        if (
+            safe_int(
+                self.state.get("loss_streak")
+            )
+            >= self.settings.max_losing_streak
+        ):
+            return (
+                "maximum losing streak reached"
+            )
+
+        if (
+            self.daily_loss_pct()
+            >= self.settings.max_daily_loss_pct
+        ):
+            return "daily loss limit reached"
+
+        if token_address:
+            if token_address in self.positions:
+                return (
+                    "token already has an open position"
+                )
+
+            cooldown_until = parse_iso(
+                self.state.setdefault(
+                    "cooldown_until",
+                    {},
+                ).get(token_address)
+            )
+
+            if (
+                cooldown_until
+                and utc_now() < cooldown_until
+            ):
+                return "token is in cooldown"
+
+        return None
+
+    async def refresh_safety_pause(
+        self,
+    ) -> str | None:
+        reason: str | None = None
+
+        if (
+            self.daily_loss_pct()
+            >= self.settings.max_daily_loss_pct
+        ):
+            reason = "daily loss limit reached"
+
+        elif (
+            safe_int(
+                self.state.get("loss_streak")
+            )
+            >= self.settings.max_losing_streak
+        ):
+            reason = (
+                "maximum losing streak reached"
+            )
+
+        if (
+            reason
+            and self.state.get(
+                "safety_pause_reason"
+            ) != reason
+        ):
+            self.state[
+                "safety_pause_reason"
+            ] = reason
+
+            await self.store.save(self.state)
+
+        return reason
+
+    async def open_position(
+        self,
+        snapshot: MarketSnapshot,
+        evaluation: Evaluation,
+    ) -> dict[str, Any] | None:
+        await self.ensure_day()
+
+        if self.entry_guard(
+            snapshot.token_address
+        ):
+            return None
+
+        equity = self.equity()
+
+        risk_usd = (
+            equity
+            * self.settings.risk_per_trade_pct
+            / 100
+        )
+
+        stop_fraction = (
+            self.settings.stop_loss_pct
+            / 100
+        )
+
+        risk_notional = (
+            risk_usd / stop_fraction
+        )
+
+        position_limit = (
+            equity
+            * self.settings.max_position_pct
+            / 100
+        )
+
+        fee_fraction = (
+            self.settings.paper_fee_bps
+            / 10_000
+        )
+
+        available_cash = (
+            self.cash / (1 + fee_fraction)
+        )
+
+        notional = min(
+            risk_notional,
+            position_limit,
+            available_cash,
+        )
+
+        if notional < 5:
+            return None
+
+        slippage_fraction = (
+            self.settings.paper_slippage_bps
+            / 10_000
+        )
+
+        fill_price = (
+            snapshot.price_usd
+            * (1 + slippage_fraction)
+        )
+
+        entry_fee = (
+            notional * fee_fraction
+        )
+
+        quantity = (
+            notional / fill_price
+        )
+
+        total_cost = (
+            notional + entry_fee
+        )
+
+        position = {
+            "token_address":
+                snapshot.token_address,
+            "symbol":
+                snapshot.symbol,
+            "name":
+                snapshot.name,
+            "pair_address":
+                snapshot.pair_address,
+            "pair_url":
+                snapshot.pair_url,
+
+            "opened_at":
+                iso_now(),
+
+            "entry_market_price":
+                snapshot.price_usd,
+            "entry_fill_price":
+                fill_price,
+            "last_market_price":
+                snapshot.price_usd,
+            "highest_market_price":
+                snapshot.price_usd,
+
+            "quantity":
+                quantity,
+            "entry_notional":
+                notional,
+            "entry_fee":
+                entry_fee,
+            "entry_total_cost":
+                total_cost,
+
+            "entry_liquidity_usd":
+                snapshot.liquidity_usd,
+            "last_liquidity_usd":
+                snapshot.liquidity_usd,
+
+            "score":
+                evaluation.score,
+            "entry_reasons":
+                evaluation.reasons,
+        }
+
+        self.state["cash"] = max(
+            0,
+            self.cash - total_cost,
+        )
+
+        self.positions[
+            snapshot.token_address
+        ] = position
+
+        self.state["day_entries"] = (
+            safe_int(
+                self.state.get("day_entries")
+            )
+            + 1
+        )
+
+        await self.store.save(self.state)
+        return position
+
+    def exit_decision(
+        self,
+        snapshot: MarketSnapshot,
+    ) -> ExitDecision:
+        position = self.positions.get(
+            snapshot.token_address
+        )
+
+        if not position:
+            return ExitDecision(False)
+
+        position["last_market_price"] = (
+            snapshot.price_usd
+        )
+
+        position["last_liquidity_usd"] = (
+            snapshot.liquidity_usd
+        )
+
+        position["highest_market_price"] = max(
+            float(
+                position.get(
+                    "highest_market_price",
+                    0,
+                )
+            ),
+            snapshot.price_usd,
+        )
+
+        entry_price = float(
+            position["entry_fill_price"]
         )
 
         pnl_pct = (
             (
-                current
-                - pos["entry_price"]
+                snapshot.price_usd
+                / entry_price
+                - 1
             )
-            / pos["entry_price"]
             * 100
+            if entry_price > 0
+            else 0
         )
 
-        pnl_dollars = (
-            pos["quantity"]
-            * current
-            - pos["position_value"]
+        highest_price = float(
+            position["highest_market_price"]
         )
 
-
-        text += (
-            f"{pos['symbol']}\n"
-            f"Score: "
-            f"{pos['score']}/100\n"
-            f"Position: "
-            f"{money(pos['position_value'])}\n"
-            f"P/L: "
-            f"{money(pnl_dollars)} "
-            f"({pnl_pct:+.2f}%)\n\n"
+        highest_gain = (
+            (
+                highest_price
+                / entry_price
+                - 1
+            )
+            * 100
+            if entry_price > 0
+            else 0
         )
 
+        pullback = (
+            (
+                highest_price
+                - snapshot.price_usd
+            )
+            / highest_price
+            * 100
+            if highest_price > 0
+            else 0
+        )
 
-    return text
+        entry_liquidity = float(
+            position.get(
+                "entry_liquidity_usd",
+                0,
+            )
+        )
+
+        if (
+            entry_liquidity > 0
+            and snapshot.liquidity_usd
+            <= (
+                entry_liquidity
+                * self.settings
+                .liquidity_exit_fraction
+            )
+        ):
+            return ExitDecision(
+                True,
+                "LIQUIDITY_DROP",
+                pnl_pct,
+            )
+
+        if (
+            pnl_pct
+            <= -self.settings.stop_loss_pct
+        ):
+            return ExitDecision(
+                True,
+                "STOP_LOSS",
+                pnl_pct,
+            )
+
+        if (
+            pnl_pct
+            >= self.settings.take_profit_pct
+        ):
+            return ExitDecision(
+                True,
+                "TAKE_PROFIT",
+                pnl_pct,
+            )
+
+        if (
+            highest_gain
+            >= self.settings
+            .trailing_activation_pct
+            and pullback
+            >= self.settings
+            .trailing_distance_pct
+        ):
+            return ExitDecision(
+                True,
+                "TRAILING_STOP",
+                pnl_pct,
+            )
+
+        if (
+            snapshot.change_5m_pct
+            <= self.settings
+            .momentum_exit_5m_pct
+            and snapshot.buy_ratio_5m
+            <= self.settings
+            .momentum_exit_buy_ratio
+        ):
+            return ExitDecision(
+                True,
+                "MOMENTUM_REVERSAL",
+                pnl_pct,
+            )
+
+        opened_at = parse_iso(
+            str(position.get("opened_at", ""))
+        )
+
+        if (
+            opened_at
+            and utc_now() - opened_at
+            >= timedelta(
+                minutes=(
+                    self.settings
+                    .max_hold_minutes
+                )
+            )
+        ):
+            return ExitDecision(
+                True,
+                "MAX_HOLD_TIME",
+                pnl_pct,
+            )
+
+        return ExitDecision(
+            False,
+            pnl_pct=pnl_pct,
+        )
+
+    async def close_position(
+        self,
+        snapshot: MarketSnapshot,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        position = self.positions.get(
+            snapshot.token_address
+        )
+
+        if not position:
+            return None
+
+        slippage_fraction = (
+            self.settings.paper_slippage_bps
+            / 10_000
+        )
+
+        fee_fraction = (
+            self.settings.paper_fee_bps
+            / 10_000
+        )
+
+        exit_fill = (
+            snapshot.price_usd
+            * (1 - slippage_fraction)
+        )
+
+        gross = (
+            float(position["quantity"])
+            * exit_fill
+        )
+
+        exit_fee = gross * fee_fraction
+        net_value = gross - exit_fee
+
+        entry_cost = float(
+            position["entry_total_cost"]
+        )
+
+        pnl_usd = net_value - entry_cost
+
+        pnl_pct = (
+            pnl_usd / entry_cost * 100
+            if entry_cost > 0
+            else 0
+        )
+
+        trade = {
+            "token_address":
+                snapshot.token_address,
+            "symbol":
+                position["symbol"],
+            "pair_address":
+                position["pair_address"],
+            "pair_url":
+                position["pair_url"],
+
+            "opened_at":
+                position["opened_at"],
+            "closed_at":
+                iso_now(),
+
+            "entry_fill_price":
+                position["entry_fill_price"],
+            "exit_fill_price":
+                exit_fill,
+            "quantity":
+                position["quantity"],
+
+            "entry_total_cost":
+                entry_cost,
+            "exit_fee":
+                exit_fee,
+
+            "pnl_usd":
+                pnl_usd,
+            "pnl_pct":
+                pnl_pct,
+            "exit_reason":
+                reason,
+            "entry_score":
+                position["score"],
+        }
+
+        self.state["cash"] = (
+            self.cash + net_value
+        )
+
+        self.state.setdefault(
+            "trades",
+            [],
+        ).append(trade)
+
+        self.positions.pop(
+            snapshot.token_address,
+            None,
+        )
+
+        self.state.setdefault(
+            "cooldown_until",
+            {},
+        )[snapshot.token_address] = (
+            utc_now()
+            + timedelta(
+                minutes=(
+                    self.settings
+                    .trade_cooldown_minutes
+                )
+            )
+        ).isoformat()
+
+        if pnl_usd > 0:
+            self.state["day_wins"] = (
+                safe_int(
+                    self.state.get("day_wins")
+                )
+                + 1
+            )
+            self.state["loss_streak"] = 0
+
+        else:
+            self.state["day_losses"] = (
+                safe_int(
+                    self.state.get("day_losses")
+                )
+                + 1
+            )
+            self.state["loss_streak"] = (
+                safe_int(
+                    self.state.get("loss_streak")
+                )
+                + 1
+            )
+
+        await self.refresh_safety_pause()
+        await self.store.save(self.state)
+
+        return trade
+
+    async def set_manual_pause(
+        self,
+        paused: bool,
+    ) -> None:
+        self.state["manual_paused"] = paused
+        await self.store.save(self.state)
+
+    async def reset(self) -> None:
+        self.state = create_new_state(
+            self.settings,
+            day=self.local_day(),
+        )
+
+        await self.store.save(self.state)
 
 
 # ============================================================
-# 22. RECENT TRADES
+# MESSAGE FORMATTERS
 # ============================================================
 
-def trades_message():
+def format_status(
+    broker: PaperBroker,
+    settings: Settings,
+    *,
+    running: bool,
+) -> str:
+    state = broker.state
+    last_scan = state.get("last_scan", {})
 
-    trades = state[
-        "closed_trades"
-    ][-10:]
-
-
-    if not trades:
-
-        return (
-            "📚 JARVIS TRADES\n\n"
-            "No completed trades yet."
-        )
-
-
-    text = (
-        "📚 LAST 10 PAPER TRADES\n\n"
+    completed_today = (
+        safe_int(state.get("day_wins"))
+        + safe_int(state.get("day_losses"))
     )
-
-
-    for trade in reversed(trades):
-
-        emoji = (
-            "✅"
-            if trade["pnl"] > 0
-            else "❌"
-        )
-
-        text += (
-            f"{emoji} "
-            f"{trade['symbol']} "
-            f"{trade['pnl_pct']:+.2f}% "
-            f"{money(trade['pnl'])}\n"
-            f"Score: "
-            f"{trade['score']} | "
-            f"{trade['exit_reason']}\n\n"
-        )
-
-
-    return text
-
-
-# ============================================================
-# 23. PERFORMANCE ANALYSIS
-# ============================================================
-
-def performance_message():
-
-    journal = load_journal()
-
-    if not journal:
-
-        return (
-            "📈 JARVIS PERFORMANCE\n\n"
-            "No completed trades yet."
-        )
-
-
-    recent = journal[-100:]
-
-
-    wins = [
-        t for t in recent
-        if t["pnl"] > 0
-    ]
-
-    losses = [
-        t for t in recent
-        if t["pnl"] <= 0
-    ]
-
-
-    n = len(recent)
 
     win_rate = (
-        len(wins) / n * 100
-    )
-
-
-    avg_win = (
-        sum(t["pnl"] for t in wins)
-        / len(wins)
-        if wins
+        safe_int(state.get("day_wins"))
+        / completed_today
+        * 100
+        if completed_today
         else 0
     )
 
-    avg_loss = (
-        sum(t["pnl"] for t in losses)
-        / len(losses)
-        if losses
-        else 0
-    )
+    guard = broker.entry_guard()
 
-
-    expectancy = (
-        sum(t["pnl"] for t in recent)
-        / n
-    )
-
-
-    total_pnl = sum(
-        t["pnl"]
-        for t in recent
-    )
-
+    if running and not guard:
+        status = "🟢 RESEARCHING"
+    else:
+        status = (
+            "🟡 "
+            + escape(
+                (guard or "STOPPED").upper()
+            )
+        )
 
     return (
-        "📈 JARVIS PERFORMANCE\n\n"
+        "🤖 <b>JARVIS V2 STATUS</b>\n\n"
 
-        f"Trades analysed: {n}\n"
-        f"Wins: {len(wins)}\n"
-        f"Losses: {len(losses)}\n"
-        f"Win rate: "
-        f"{win_rate:.1f}%\n\n"
+        f"Cash: <b>{money(broker.cash)}</b>\n"
+        f"Equity: <b>{money(broker.equity())}</b>\n"
+        "Total P/L: <b>"
+        f"{money(broker.total_realized_pnl() + broker.open_pnl())}"
+        "</b>\n"
+        f"Open P/L: <b>{money(broker.open_pnl())}</b>\n\n"
 
-        f"Average winner: "
-        f"{money(avg_win)}\n"
-        f"Average loser: "
-        f"{money(avg_loss)}\n\n"
+        "Today's wins: "
+        f"<b>{state.get('day_wins', 0)}</b>\n"
 
-        f"Expectancy/trade: "
-        f"{money(expectancy)}\n"
+        "Today's losses: "
+        f"<b>{state.get('day_losses', 0)}</b>\n"
 
-        f"Total P/L: "
-        f"{money(total_pnl)}\n\n"
+        f"Win rate: <b>{win_rate:.1f}%</b>\n\n"
 
-        "A strategy should not be judged "
-        "from only a handful of trades."
+        "Open positions: "
+        f"<b>{len(broker.positions)}/"
+        f"{settings.max_open_positions}</b>\n"
+
+        "Entries: "
+        f"<b>{state.get('day_entries', 0)}/"
+        f"{settings.max_daily_entries}</b>\n"
+
+        "Loss streak: "
+        f"<b>{state.get('loss_streak', 0)}/"
+        f"{settings.max_losing_streak}</b>\n"
+
+        "Daily loss: "
+        f"<b>{broker.daily_loss_pct():.2f}%/"
+        f"{settings.max_daily_loss_pct:.2f}%</b>\n\n"
+
+        "Risk/trade: "
+        f"<b>{settings.risk_per_trade_pct:.2f}%</b>\n"
+
+        f"Stop: <b>{settings.stop_loss_pct:.1f}%</b>\n"
+
+        "Target: "
+        f"<b>+{settings.take_profit_pct:.1f}%</b>\n"
+
+        "Minimum score: "
+        f"<b>{settings.min_score}/100</b>\n\n"
+
+        "Last scan: "
+        f"<b>{last_scan.get('discovered', 0)} discovered · "
+        f"{last_scan.get('snapshots', 0)} priced · "
+        f"{last_scan.get('qualified', 0)} qualified</b>\n\n"
+
+        f"Status: {status}\n"
+        "Mode: 🧪 <b>PAPER TRADING</b>"
+    )
+
+
+def format_entry(
+    position: dict[str, Any],
+    snapshot: MarketSnapshot,
+    evaluation: Evaluation,
+    rug_report: RugReport,
+) -> str:
+    rug_value = (
+        f"{rug_report.normalized_score}/100"
+        if rug_report.normalized_score
+        is not None
+        else "Unavailable"
+    )
+
+    return (
+        "🧪 <b>PAPER ENTRY</b>\n\n"
+
+        f"Token: <b>{escape(snapshot.symbol)}</b>\n"
+        f"Score: <b>{evaluation.score}/100</b>\n"
+
+        "Position: <b>"
+        f"{money(float(position['entry_total_cost']))}"
+        "</b>\n"
+
+        "Paper fill: <b>"
+        f"{price(float(position['entry_fill_price']))}"
+        "</b>\n"
+
+        "Liquidity: "
+        f"<b>{money(snapshot.liquidity_usd)}</b>\n"
+
+        "Volume: "
+        f"<b>{money(snapshot.volume_24h_usd)}</b>\n"
+
+        "5m / 1h: "
+        f"<b>{percentage(snapshot.change_5m_pct)} / "
+        f"{percentage(snapshot.change_1h_pct)}</b>\n"
+
+        "Buy ratio: "
+        f"<b>{snapshot.buy_ratio_5m:.0%}</b>\n"
+
+        f"RugCheck: <b>{escape(rug_value)}</b>\n\n"
+
+        "<a href=\""
+        f"{escape(snapshot.pair_url, quote=True)}"
+        "\">Open DexScreener</a>\n"
+
+        f"CA: <code>{escape(snapshot.token_address)}</code>"
+    )
+
+
+def format_exit(
+    trade: dict[str, Any],
+) -> str:
+    pnl_usd = float(
+        trade.get("pnl_usd", 0)
+    )
+
+    icon = "✅" if pnl_usd > 0 else "🛑"
+
+    return (
+        f"{icon} <b>PAPER EXIT — "
+        f"{escape(str(trade.get('exit_reason', 'EXIT')))}"
+        "</b>\n\n"
+
+        "Token: <b>"
+        f"{escape(str(trade.get('symbol', 'UNKNOWN')))}"
+        "</b>\n"
+
+        "P/L: <b>"
+        f"{money(pnl_usd)} "
+        f"({percentage(float(trade.get('pnl_pct', 0)))})"
+        "</b>\n"
+
+        "Entry: <b>"
+        f"{price(float(trade.get('entry_fill_price', 0)))}"
+        "</b>\n"
+
+        "Exit: <b>"
+        f"{price(float(trade.get('exit_fill_price', 0)))}"
+        "</b>"
     )
 
 
 # ============================================================
-# 24. TELEGRAM COMMANDS
+# RESEARCH ENGINE
 # ============================================================
 
-def handle_command(
-    command,
-    chat_id
-):
-
-    cmd = command.lower().strip()
-
-    cmd = cmd.split("@")[0]
+Notifier = Callable[
+    [str],
+    Awaitable[None],
+]
 
 
-    if cmd in (
-        "/start",
-        "/help"
+class ResearchEngine:
+    def __init__(
+        self,
+        settings: Settings,
+        market: MarketDataClient,
+        strategy: Strategy,
+        broker: PaperBroker,
+        store: StateStore,
     ):
+        self.settings = settings
+        self.market = market
+        self.strategy = strategy
+        self.broker = broker
+        self.store = store
 
-        telegram_send(
-            "🤖 JARVIS COMMANDS\n\n"
+        self.notifier: Notifier | None = None
+        self.scan_lock = asyncio.Lock()
 
-            "/status - bot status\n"
-            "/today - today's status\n"
-            "/positions - open positions\n"
-            "/trades - recent trades\n"
-            "/performance - statistics\n"
-            "/scan - run a scan now\n"
-            "/pause - pause entries\n"
-            "/resume - resume entries\n"
-            "/resetday - reset daily counters\n"
-            "/paper - confirm trading mode\n"
-            "/help - commands\n\n"
+        self.running = False
+        self.started_at = time.monotonic()
 
-            "Mode: PAPER TRADING ONLY",
-            chat_id
-        )
+        self.last_scan_at: str | None = None
+        self.last_loop_at: str | None = None
+        self.last_error: str | None = None
 
+        self.candidates: list[
+            tuple[
+                MarketSnapshot,
+                Evaluation,
+                RugReport,
+            ]
+        ] = []
 
-    elif cmd in (
-        "/status",
-        "/today"
-    ):
+    def set_notifier(
+        self,
+        notifier: Notifier,
+    ) -> None:
+        self.notifier = notifier
 
-        telegram_send(
-            status_message(),
-            chat_id
-        )
-
-
-    elif cmd == "/positions":
-
-        telegram_send(
-            positions_message(),
-            chat_id
-        )
-
-
-    elif cmd == "/trades":
-
-        telegram_send(
-            trades_message(),
-            chat_id
-        )
-
-
-    elif cmd == "/performance":
-
-        telegram_send(
-            performance_message(),
-            chat_id
-        )
-
-
-    elif cmd == "/pause":
-
-        state["entries_paused"] = True
-
-        save_state()
-
-        telegram_send(
-            "⏸ JARVIS PAUSED\n\n"
-            "No new entries.\n"
-            "Open positions will still "
-            "be managed.",
-            chat_id
-        )
-
-
-    elif cmd == "/resume":
-
-        if (
-            state["consecutive_losses"]
-            >= MAX_CONSECUTIVE_LOSSES
-        ):
-
-            telegram_send(
-                "🛑 Cannot resume.\n\n"
-                "Maximum consecutive-loss "
-                "limit has been reached.\n\n"
-                "Wait for tomorrow or use "
-                "/resetday after reviewing "
-                "the trades.",
-                chat_id
-            )
-
+    async def notify(
+        self,
+        message: str,
+    ) -> None:
+        if not self.notifier:
             return
-
-        if (
-            daily_loss_pct()
-            >= MAX_DAILY_LOSS_PCT
-        ):
-
-            telegram_send(
-                "🛑 Cannot resume.\n\n"
-                "Daily loss limit reached.",
-                chat_id
-            )
-
-            return
-
-
-        state["entries_paused"] = False
-
-        save_state()
-
-        telegram_send(
-            "▶️ JARVIS RESUMED\n\n"
-            "Research entries enabled.",
-            chat_id
-        )
-
-
-    elif cmd == "/resetday":
-
-        manual_reset_day()
-
-
-    elif cmd == "/paper":
-
-        telegram_send(
-            "🧪 JARVIS MODE\n\n"
-            "PAPER TRADING ONLY\n\n"
-            "No real wallet connected.\n"
-            "No real orders are placed.",
-            chat_id
-        )
-
-
-    elif cmd == "/scan":
-
-        telegram_send(
-            "🔎 JARVIS SCAN STARTED",
-            chat_id
-        )
-
-        scan_market()
-
-        telegram_send(
-            "✅ Scan finished.",
-            chat_id
-        )
-
-
-# ============================================================
-# 25. POLL TELEGRAM
-# ============================================================
-
-def process_telegram():
-
-    updates = telegram_updates(
-        state.get(
-            "telegram_offset"
-        )
-    )
-
-
-    for update in updates:
 
         try:
+            await self.notifier(message)
+        except Exception as exc:
+            LOGGER.warning(
+                "Notification failed: %s",
+                exc,
+            )
 
-            update_id = update[
-                "update_id"
+    async def run(self) -> None:
+        self.running = True
+        await self.market.start()
+
+        next_scan = 0.0
+        next_position_update = 0.0
+
+        next_status = (
+            time.monotonic()
+            + self.settings.status_interval_seconds
+        )
+
+        while self.running:
+            self.last_loop_at = iso_now()
+            now = time.monotonic()
+
+            try:
+                day_changed = (
+                    await self.broker.ensure_day()
+                )
+
+                if day_changed:
+                    await self.notify(
+                        "🌅 <b>New Sydney trading day.</b> "
+                        "Daily paper limits reset."
+                    )
+
+                if now >= next_position_update:
+                    await self.update_positions()
+
+                    next_position_update = (
+                        time.monotonic()
+                        + self.settings
+                        .price_update_seconds
+                    )
+
+                if now >= next_scan:
+                    await self.scan_market()
+
+                    next_scan = (
+                        time.monotonic()
+                        + self.settings
+                        .scan_interval_seconds
+                    )
+
+                if now >= next_status:
+                    await self.notify(
+                        format_status(
+                            self.broker,
+                            self.settings,
+                            running=True,
+                        )
+                    )
+
+                    next_status = (
+                        time.monotonic()
+                        + self.settings
+                        .status_interval_seconds
+                    )
+
+                await asyncio.sleep(1)
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception as exc:
+                self.last_error = str(exc)
+
+                LOGGER.exception(
+                    "Research loop error"
+                )
+
+                await asyncio.sleep(3)
+
+    async def stop(self) -> None:
+        self.running = False
+        await self.store.save(
+            self.broker.state
+        )
+        await self.market.close()
+
+    async def scan_market(
+        self,
+    ) -> dict[str, Any]:
+        if self.scan_lock.locked():
+            return dict(
+                self.broker.state.get(
+                    "last_scan",
+                    {},
+                )
+            )
+
+        async with self.scan_lock:
+            discoveries = (
+                await self.market.discover_tokens()
+            )
+
+            snapshots = (
+                await self.market
+                .fetch_many_snapshots(
+                    discoveries
+                )
+            )
+
+            rejection_counts: Counter[str] = (
+                Counter()
+            )
+
+            market_passed: list[
+                MarketSnapshot
+            ] = []
+
+            for snapshot in snapshots:
+                blocks = (
+                    self.strategy.market_blocks(
+                        snapshot
+                    )
+                )
+
+                if blocks:
+                    rejection_counts.update(
+                        blocks
+                    )
+                else:
+                    market_passed.append(
+                        snapshot
+                    )
+
+            rug_results = await asyncio.gather(
+                *(
+                    self.market.fetch_rug_report(
+                        snapshot.token_address
+                    )
+                    for snapshot in market_passed
+                ),
+                return_exceptions=True,
+            )
+
+            evaluated: list[
+                tuple[
+                    MarketSnapshot,
+                    Evaluation,
+                    RugReport,
+                ]
+            ] = []
+
+            for snapshot, result in zip(
+                market_passed,
+                rug_results,
+                strict=True,
+            ):
+                rug_report = (
+                    result
+                    if isinstance(
+                        result,
+                        RugReport,
+                    )
+                    else RugReport(
+                        available=False,
+                        error=str(result),
+                    )
+                )
+
+                evaluation = (
+                    self.strategy.evaluate(
+                        snapshot,
+                        rug_report,
+                    )
+                )
+
+                if evaluation.blocks:
+                    rejection_counts.update(
+                        evaluation.blocks
+                    )
+
+                evaluated.append(
+                    (
+                        snapshot,
+                        evaluation,
+                        rug_report,
+                    )
+                )
+
+            evaluated.sort(
+                key=lambda item: (
+                    item[1].passed,
+                    item[1].score,
+                    item[0].liquidity_usd,
+                ),
+                reverse=True,
+            )
+
+            self.candidates = evaluated[:10]
+
+            qualified = [
+                item
+                for item in evaluated
+                if item[1].passed
             ]
 
-            state[
-                "telegram_offset"
-            ] = update_id + 1
+            stats = {
+                "at": iso_now(),
+                "discovered":
+                    len(discoveries),
+                "snapshots":
+                    len(snapshots),
+                "market_passed":
+                    len(market_passed),
+                "qualified":
+                    len(qualified),
+                "top_score": (
+                    evaluated[0][1].score
+                    if evaluated
+                    else 0
+                ),
+                "top_blocks":
+                    rejection_counts.most_common(5),
+            }
 
+            self.last_scan_at = stats["at"]
 
-            message = update.get(
-                "message"
+            self.broker.state[
+                "last_scan"
+            ] = stats
+
+            await self.store.save(
+                self.broker.state
             )
 
-            if not message:
+            for (
+                snapshot,
+                evaluation,
+                rug_report,
+            ) in qualified:
+                if self.broker.entry_guard(
+                    snapshot.token_address
+                ):
+                    continue
+
+                position = (
+                    await self.broker.open_position(
+                        snapshot,
+                        evaluation,
+                    )
+                )
+
+                if position:
+                    await self.notify(
+                        format_entry(
+                            position,
+                            snapshot,
+                            evaluation,
+                            rug_report,
+                        )
+                    )
+
+            await self.broker.refresh_safety_pause()
+
+            self.last_error = None
+            return stats
+
+    async def update_positions(self) -> None:
+        if not self.broker.positions:
+            return
+
+        saved_positions = [
+            dict(position)
+            for position
+            in self.broker.positions.values()
+        ]
+
+        results = await asyncio.gather(
+            *(
+                self.market.fetch_snapshot(
+                    str(
+                        position["token_address"]
+                    ),
+                    ("open position",),
+                    preferred_pair=str(
+                        position.get(
+                            "pair_address",
+                            "",
+                        )
+                    ),
+                )
+                for position
+                in saved_positions
+            ),
+            return_exceptions=True,
+        )
+
+        state_changed = False
+
+        for saved_position, result in zip(
+            saved_positions,
+            results,
+            strict=True,
+        ):
+            address = str(
+                saved_position["token_address"]
+            )
+
+            if not isinstance(
+                result,
+                MarketSnapshot,
+            ):
                 continue
 
-
-            text = message.get(
-                "text",
-                ""
-            ).strip()
-
-
-            chat_id = (
-                message.get(
-                    "chat",
-                    {}
-                ).get("id")
+            decision = (
+                self.broker.exit_decision(
+                    result
+                )
             )
 
+            state_changed = True
 
-            if text.startswith("/"):
+            rug_report = (
+                await self.market.fetch_rug_report(
+                    address
+                )
+            )
 
-                command = (
-                    text.split()[0]
+            if rug_report.has_danger:
+                decision.should_exit = True
+                decision.reason = (
+                    "RUGCHECK_DANGER"
                 )
 
-                handle_command(
+            if decision.should_exit:
+                trade = (
+                    await self.broker.close_position(
+                        result,
+                        decision.reason,
+                    )
+                )
+
+                if trade:
+                    await self.notify(
+                        format_exit(trade)
+                    )
+
+        if state_changed:
+            await self.store.save(
+                self.broker.state
+            )
+
+    async def analyse_token(
+        self,
+        token_address: str,
+    ) -> tuple[
+        MarketSnapshot,
+        Evaluation,
+        RugReport,
+    ] | None:
+        snapshot = (
+            await self.market.fetch_snapshot(
+                token_address,
+                ("manual scan",),
+            )
+        )
+
+        if not snapshot:
+            return None
+
+        rug_report = (
+            await self.market.fetch_rug_report(
+                token_address,
+                force=True,
+            )
+        )
+
+        evaluation = self.strategy.evaluate(
+            snapshot,
+            rug_report,
+        )
+
+        return (
+            snapshot,
+            evaluation,
+            rug_report,
+        )
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "ok": self.running,
+            "mode": "paper",
+            "uptime_seconds": int(
+                time.monotonic()
+                - self.started_at
+            ),
+            "last_loop_at":
+                self.last_loop_at,
+            "last_scan_at":
+                self.last_scan_at,
+            "open_positions":
+                len(self.broker.positions),
+            "equity":
+                round(self.broker.equity(), 2),
+            "api_requests":
+                self.market.request_count,
+            "last_error":
+                self.last_error
+                or self.market.last_error,
+        }
+
+
+# ============================================================
+# RAILWAY HEALTH SERVER
+# ============================================================
+
+class HealthServer:
+    def __init__(
+        self,
+        engine: ResearchEngine,
+        port: int,
+    ):
+        self.engine = engine
+        self.port = port
+        self.runner: web.AppRunner | None = None
+
+    async def start(self) -> None:
+        app = web.Application()
+
+        app.router.add_get(
+            "/",
+            self.index,
+        )
+
+        app.router.add_get(
+            "/health",
+            self.health,
+        )
+
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+
+        site = web.TCPSite(
+            self.runner,
+            "0.0.0.0",
+            self.port,
+        )
+
+        await site.start()
+
+    async def stop(self) -> None:
+        if self.runner:
+            await self.runner.cleanup()
+
+    async def index(
+        self,
+        request: web.Request,
+    ) -> web.Response:
+        return web.json_response(
+            {
+                "service": "Jarvis V2.1",
+                "mode": "paper",
+                "health": "/health",
+            }
+        )
+
+    async def health(
+        self,
+        request: web.Request,
+    ) -> web.Response:
+        result = self.engine.health()
+
+        return web.json_response(
+            result,
+            status=(
+                200
+                if result["ok"]
+                else 503
+            ),
+        )
+
+
+# ============================================================
+# TELEGRAM COMMANDS
+# ============================================================
+
+SOLANA_ADDRESS_PATTERN = re.compile(
+    r"^[1-9A-HJ-NP-Za-km-z]{32,44}$"
+)
+
+
+class TelegramInterface:
+    def __init__(
+        self,
+        settings: Settings,
+        engine: ResearchEngine,
+        broker: PaperBroker,
+    ):
+        self.settings = settings
+        self.engine = engine
+        self.broker = broker
+
+    def authorised(
+        self,
+        update: Update,
+    ) -> bool:
+        chat = update.effective_chat
+
+        return bool(
+            chat
+            and chat.id
+            in self.settings.allowed_chat_ids
+        )
+
+    async def reply(
+        self,
+        update: Update,
+        message: str,
+    ) -> None:
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                message,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+
+    async def reject(
+        self,
+        update: Update,
+    ) -> None:
+        await self.reply(
+            update,
+            "This chat is not authorised "
+            "for Jarvis.",
+        )
+
+    def create_application(
+        self,
+        *,
+        post_init: Callable,
+        post_shutdown: Callable,
+    ) -> Application:
+        application = (
+            ApplicationBuilder()
+            .token(
+                self.settings.telegram_bot_token
+            )
+            .post_init(post_init)
+            .post_shutdown(post_shutdown)
+            .build()
+        )
+
+        command_handlers = {
+            "start": self.start,
+            "status": self.status,
+            "paper": self.status,
+            "today": self.today,
+            "positions": self.positions,
+            "trades": self.trades,
+            "scan": self.scan,
+            "candidates": self.candidates,
+            "health": self.health,
+            "settings": self.show_settings,
+            "pause": self.pause,
+            "resume": self.resume,
+            "resetpaper": self.resetpaper,
+            "help": self.help_command,
+        }
+
+        for command, handler in (
+            command_handlers.items()
+        ):
+            application.add_handler(
+                CommandHandler(
                     command,
-                    chat_id
+                    handler,
+                )
+            )
+
+        application.add_error_handler(
+            self.error_handler
+        )
+
+        return application
+
+    async def configure_commands(
+        self,
+        application: Application,
+    ) -> None:
+        await application.bot.set_my_commands(
+            [
+                BotCommand(
+                    "status",
+                    "Account and risk status",
+                ),
+                BotCommand(
+                    "scan",
+                    "Scan market or token address",
+                ),
+                BotCommand(
+                    "candidates",
+                    "Latest ranked candidates",
+                ),
+                BotCommand(
+                    "positions",
+                    "Open paper positions",
+                ),
+                BotCommand(
+                    "trades",
+                    "Completed paper trades",
+                ),
+                BotCommand(
+                    "today",
+                    "Today's paper results",
+                ),
+                BotCommand(
+                    "health",
+                    "Service health",
+                ),
+                BotCommand(
+                    "pause",
+                    "Pause new entries",
+                ),
+                BotCommand(
+                    "resume",
+                    "Resume new entries",
+                ),
+                BotCommand(
+                    "settings",
+                    "Strategy settings",
+                ),
+                BotCommand(
+                    "help",
+                    "Show all commands",
+                ),
+            ]
+        )
+
+    async def start(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not self.authorised(update):
+            await self.reject(update)
+            return
+
+        await self.reply(
+            update,
+            "🤖 <b>JARVIS V2.1 IS ONLINE</b>\n\n"
+            "Live Solana research with "
+            "simulated money only.\n"
+            "No wallet is connected.\n\n"
+            "Use /scan to scan the market now.",
+        )
+
+    async def status(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not self.authorised(update):
+            await self.reject(update)
+            return
+
+        await self.reply(
+            update,
+            format_status(
+                self.broker,
+                self.settings,
+                running=self.engine.running,
+            ),
+        )
+
+    async def scan(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not self.authorised(update):
+            await self.reject(update)
+            return
+
+        if not context.args:
+            if self.engine.scan_lock.locked():
+                await self.reply(
+                    update,
+                    "🔎 <b>A market scan is "
+                    "already running.</b>",
+                )
+                return
+
+            await self.reply(
+                update,
+                "🔎 <b>JARVIS MARKET SCAN "
+                "STARTED</b>",
+            )
+
+            try:
+                stats = (
+                    await self.engine.scan_market()
                 )
 
+            except Exception as exc:
+                LOGGER.exception(
+                    "Manual scan failed"
+                )
 
-        except Exception:
+                await self.reply(
+                    update,
+                    "❌ <b>SCAN FAILED</b>\n\n"
+                    f"{escape(str(exc))}",
+                )
+                return
 
-            traceback.print_exc()
+            top_blocks = stats.get(
+                "top_blocks",
+                [],
+            )
 
+            rejection_text = (
+                "\n".join(
+                    "• "
+                    f"{escape(str(reason))}: "
+                    f"<b>{count}</b>"
+                    for reason, count
+                    in top_blocks
+                )
+                if top_blocks
+                else "None"
+            )
 
-    save_state()
+            await self.reply(
+                update,
+                "✅ <b>MARKET SCAN FINISHED</b>\n\n"
+
+                "Discovered: "
+                f"<b>{stats.get('discovered', 0)}</b>\n"
+
+                "Valid prices: "
+                f"<b>{stats.get('snapshots', 0)}</b>\n"
+
+                "Passed market filters: "
+                f"<b>{stats.get('market_passed', 0)}</b>\n"
+
+                "Qualified: "
+                f"<b>{stats.get('qualified', 0)}</b>\n"
+
+                "Top score: "
+                f"<b>{stats.get('top_score', 0)}/100</b>\n\n"
+
+                "<b>Main rejection reasons</b>\n"
+                f"{rejection_text}",
+            )
+
+            return
+
+        token_address = (
+            context.args[0].strip()
+        )
+
+        if not SOLANA_ADDRESS_PATTERN.fullmatch(
+            token_address
+        ):
+            await self.reply(
+                update,
+                "Usage:\n"
+                "<code>/scan</code>\n"
+                "or\n"
+                "<code>/scan SOLANA_TOKEN_ADDRESS</code>",
+            )
+            return
+
+        await self.reply(
+            update,
+            "🔎 Researching that token with "
+            "DexScreener and RugCheck…",
+        )
+
+        result = await self.engine.analyse_token(
+            token_address
+        )
+
+        if not result:
+            await self.reply(
+                update,
+                "No valid Solana pair was found.",
+            )
+            return
+
+        snapshot, evaluation, rug_report = result
+
+        verdict = (
+            "✅ QUALIFIES"
+            if evaluation.passed
+            else "⛔️ DOES NOT QUALIFY"
+        )
+
+        blocks = (
+            ", ".join(
+                escape(block)
+                for block
+                in evaluation.blocks[:6]
+            )
+            or "None"
+        )
+
+        rug_value = (
+            f"{rug_report.normalized_score}/100"
+            if rug_report.normalized_score
+            is not None
+            else "Unavailable"
+        )
+
+        await self.reply(
+            update,
+            "🧠 <b>JARVIS ANALYSIS — "
+            f"{verdict}</b>\n\n"
+
+            f"Token: <b>{escape(snapshot.symbol)}</b>\n"
+            f"Score: <b>{evaluation.score}/100</b>\n"
+            f"Price: <b>{price(snapshot.price_usd)}</b>\n"
+
+            "Liquidity: "
+            f"<b>{money(snapshot.liquidity_usd)}</b>\n"
+
+            "24h volume: "
+            f"<b>{money(snapshot.volume_24h_usd)}</b>\n"
+
+            "5m / 1h: "
+            f"<b>{percentage(snapshot.change_5m_pct)} / "
+            f"{percentage(snapshot.change_1h_pct)}</b>\n"
+
+            "Buy ratio: "
+            f"<b>{snapshot.buy_ratio_5m:.0%}</b>\n"
+
+            f"RugCheck: <b>{escape(rug_value)}</b>\n"
+            f"Blocks: {blocks}\n\n"
+
+            "<a href=\""
+            f"{escape(snapshot.pair_url, quote=True)}"
+            "\">Open DexScreener</a>\n"
+
+            f"CA: <code>{escape(snapshot.token_address)}</code>",
+        )
+
+    async def candidates(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not self.authorised(update):
+            await self.reject(update)
+            return
+
+        if not self.engine.candidates:
+            await self.reply(
+                update,
+                "🔎 <b>No candidates passed the "
+                "market filters in the latest scan.</b>\n\n"
+                "Run /scan to see the rejection reasons.",
+            )
+            return
+
+        lines = [
+            "🔎 <b>LATEST RANKED CANDIDATES</b>"
+        ]
+
+        for (
+            snapshot,
+            evaluation,
+            rug_report,
+        ) in self.engine.candidates[:5]:
+            icon = (
+                "✅"
+                if evaluation.passed
+                else "⚪️"
+            )
+
+            rug_value = (
+                rug_report.normalized_score
+                if rug_report.normalized_score
+                is not None
+                else "—"
+            )
+
+            lines.extend(
+                [
+                    "",
+                    f"{icon} <b>"
+                    f"{escape(snapshot.symbol)}</b> "
+                    f"— {evaluation.score}/100",
+
+                    "Liquidity "
+                    f"{money(snapshot.liquidity_usd)} "
+                    "· Volume "
+                    f"{money(snapshot.volume_24h_usd)}",
+
+                    "5m "
+                    f"{percentage(snapshot.change_5m_pct)} "
+                    "· Buys "
+                    f"{snapshot.buy_ratio_5m:.0%} "
+                    f"· Rug {rug_value}",
+
+                    f"<code>{escape(snapshot.token_address)}</code>",
+                ]
+            )
+
+        await self.reply(
+            update,
+            "\n".join(lines),
+        )
+
+    async def today(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not self.authorised(update):
+            await self.reject(update)
+            return
+
+        state = self.broker.state
+
+        await self.reply(
+            update,
+            "📅 <b>TODAY — SYDNEY TIME</b>\n\n"
+
+            "Equity change: "
+            f"<b>{money(self.broker.today_pnl())}</b>\n"
+
+            "Entries: "
+            f"<b>{state.get('day_entries', 0)}/"
+            f"{self.settings.max_daily_entries}</b>\n"
+
+            "Wins / losses: "
+            f"<b>{state.get('day_wins', 0)} / "
+            f"{state.get('day_losses', 0)}</b>\n"
+
+            "Daily loss: "
+            f"<b>{self.broker.daily_loss_pct():.2f}%</b>",
+        )
+
+    async def positions(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not self.authorised(update):
+            await self.reject(update)
+            return
+
+        if not self.broker.positions:
+            await self.reply(
+                update,
+                "📭 <b>No open paper positions.</b>",
+            )
+            return
+
+        lines = [
+            "📊 <b>OPEN PAPER POSITIONS</b>"
+        ]
+
+        for position in (
+            self.broker.positions.values()
+        ):
+            current_value = (
+                self.broker.estimated_exit_value(
+                    position
+                )
+            )
+
+            entry_cost = float(
+                position.get(
+                    "entry_total_cost",
+                    0,
+                )
+            )
+
+            pnl_usd = (
+                current_value - entry_cost
+            )
+
+            pnl_pct = (
+                pnl_usd / entry_cost * 100
+                if entry_cost
+                else 0
+            )
+
+            lines.extend(
+                [
+                    "",
+                    "<b>"
+                    f"{escape(str(position.get('symbol', 'UNKNOWN')))}"
+                    "</b>",
+
+                    "Value: "
+                    f"{money(current_value)}",
+
+                    "P/L: "
+                    f"<b>{money(pnl_usd)} "
+                    f"({percentage(pnl_pct)})</b>",
+
+                    "Score: "
+                    f"{position.get('score', 0)}/100",
+                ]
+            )
+
+        await self.reply(
+            update,
+            "\n".join(lines),
+        )
+
+    async def trades(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not self.authorised(update):
+            await self.reject(update)
+            return
+
+        trades = self.broker.state.get(
+            "trades",
+            [],
+        )[-10:]
+
+        if not trades:
+            await self.reply(
+                update,
+                "📭 <b>No completed paper trades.</b>",
+            )
+            return
+
+        lines = [
+            "📚 <b>LAST PAPER TRADES</b>"
+        ]
+
+        for trade in reversed(trades):
+            pnl_usd = float(
+                trade.get("pnl_usd", 0)
+            )
+
+            icon = (
+                "✅" if pnl_usd > 0 else "❌"
+            )
+
+            lines.append(
+                f"{icon} <b>"
+                f"{escape(str(trade.get('symbol', 'UNKNOWN')))}"
+                "</b> "
+                f"{money(pnl_usd)} "
+                f"({percentage(float(trade.get('pnl_pct', 0)))}) "
+                "— "
+                f"{escape(str(trade.get('exit_reason', 'EXIT')))}"
+            )
+
+        await self.reply(
+            update,
+            "\n".join(lines),
+        )
+
+    async def health(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not self.authorised(update):
+            await self.reject(update)
+            return
+
+        result = self.engine.health()
+
+        await self.reply(
+            update,
+            "🩺 <b>JARVIS HEALTH</b>\n\n"
+
+            "Loop: "
+            f"<b>{'running' if result['ok'] else 'stopped'}</b>\n"
+
+            "Uptime: "
+            f"<b>{result['uptime_seconds']} seconds</b>\n"
+
+            "API requests: "
+            f"<b>{result['api_requests']}</b>\n"
+
+            "Last scan: "
+            f"<b>{escape(str(result['last_scan_at'] or 'not yet'))}</b>\n"
+
+            "Last error: "
+            f"<b>{escape(str(result['last_error'] or 'none'))}</b>",
+        )
+
+    async def show_settings(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not self.authorised(update):
+            await self.reject(update)
+            return
+
+        settings = self.settings
+
+        await self.reply(
+            update,
+            "⚙️ <b>JARVIS V2.1 SETTINGS</b>\n\n"
+
+            "Balance: "
+            f"<b>{money(settings.starting_balance_usd)}</b>\n"
+
+            "Risk/trade: "
+            f"<b>{settings.risk_per_trade_pct:.2f}%</b>\n"
+
+            "Max position: "
+            f"<b>{settings.max_position_pct:.1f}%</b>\n"
+
+            "Open positions: "
+            f"<b>{settings.max_open_positions}</b>\n"
+
+            "Stop / target: "
+            f"<b>{settings.stop_loss_pct:.1f}% / "
+            f"+{settings.take_profit_pct:.1f}%</b>\n"
+
+            "Daily loss limit: "
+            f"<b>{settings.max_daily_loss_pct:.1f}%</b>\n"
+
+            "Maximum loss streak: "
+            f"<b>{settings.max_losing_streak}</b>\n"
+
+            "Maximum entries: "
+            f"<b>{settings.max_daily_entries}</b>\n"
+
+            "Minimum score: "
+            f"<b>{settings.min_score}/100</b>\n\n"
+
+            "Mode: 🧪 <b>PAPER TRADING</b>",
+        )
+
+    async def pause(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not self.authorised(update):
+            await self.reject(update)
+            return
+
+        await self.broker.set_manual_pause(
+            True
+        )
+
+        await self.reply(
+            update,
+            "⏸ <b>NEW PAPER ENTRIES PAUSED.</b>\n"
+            "Open positions remain monitored.",
+        )
+
+    async def resume(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not self.authorised(update):
+            await self.reject(update)
+            return
+
+        await self.broker.set_manual_pause(
+            False
+        )
+
+        safety_reason = (
+            await self.broker
+            .refresh_safety_pause()
+        )
+
+        if safety_reason:
+            await self.reply(
+                update,
+                "⚠️ Cannot resume: "
+                f"<b>{escape(safety_reason)}</b>",
+            )
+        else:
+            await self.reply(
+                update,
+                "▶️ <b>NEW PAPER ENTRIES "
+                "RESUMED.</b>",
+            )
+
+    async def resetpaper(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not self.authorised(update):
+            await self.reject(update)
+            return
+
+        if (
+            not context.args
+            or context.args[0].upper()
+            != "CONFIRM"
+        ):
+            await self.reply(
+                update,
+                "To erase all simulated history, "
+                "send:\n"
+                "<code>/resetpaper CONFIRM</code>",
+            )
+            return
+
+        await self.broker.reset()
+
+        await self.reply(
+            update,
+            "♻️ <b>PAPER ACCOUNT RESET TO "
+            f"{money(self.settings.starting_balance_usd)}</b>",
+        )
+
+    async def help_command(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not self.authorised(update):
+            await self.reject(update)
+            return
+
+        await self.reply(
+            update,
+            "🤖 <b>JARVIS V2.1 COMMANDS</b>\n\n"
+
+            "/scan — scan the market now\n"
+            "/scan &lt;address&gt; — analyse token\n"
+            "/status — account and latest scan\n"
+            "/candidates — ranked candidates\n"
+            "/today — today's performance\n"
+            "/positions — open positions\n"
+            "/trades — completed trades\n"
+            "/health — service health\n"
+            "/settings — current settings\n"
+            "/pause — pause new entries\n"
+            "/resume — resume entries\n"
+            "/resetpaper CONFIRM — reset account",
+        )
+
+    async def error_handler(
+        self,
+        update: object,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        LOGGER.exception(
+            "Telegram command error",
+            exc_info=context.error,
+        )
 
 
 # ============================================================
-# 26. STARTUP
+# APPLICATION
 # ============================================================
 
-def startup():
+def configure_logging() -> None:
+    log_level = os.getenv(
+        "LOG_LEVEL",
+        "INFO",
+    ).upper()
 
-    reset_day_if_needed()
-
-    telegram_send(
-        "🤖 JARVIS ONLINE\n\n"
-
-        "Safer paper research mode started.\n\n"
-
-        f"Starting balance: "
-        f"{money(STARTING_BALANCE)}\n"
-
-        f"Risk per trade: "
-        f"{RISK_PER_TRADE_PCT:.2f}%\n"
-
-        f"Daily loss limit: "
-        f"{MAX_DAILY_LOSS_PCT:.2f}%\n"
-
-        f"Max loss streak: "
-        f"{MAX_CONSECUTIVE_LOSSES}\n"
-
-        f"Max daily entries: "
-        f"{MAX_DAILY_ENTRIES}\n"
-
-        f"Minimum score: "
-        f"{MIN_SCORE}/100\n\n"
-
-        "Mode: 🧪 PAPER TRADING"
+    logging.basicConfig(
+        level=getattr(
+            logging,
+            log_level,
+            logging.INFO,
+        ),
+        format=(
+            "%(asctime)s | %(levelname)s | "
+            "%(name)s | %(message)s"
+        ),
     )
 
+    logging.getLogger(
+        "httpx"
+    ).setLevel(logging.WARNING)
 
-# ============================================================
-# 27. MAIN LOOP
-# ============================================================
-
-def main():
-
-    startup()
-
-
-    last_scan_time = 0
-
-    last_position_time = 0
-
-    last_status_time = time.time()
+    logging.getLogger(
+        "aiohttp.access"
+    ).setLevel(logging.WARNING)
 
 
-    while True:
+def main() -> None:
+    load_dotenv()
+    configure_logging()
 
-        try:
+    settings = Settings.from_env()
 
-            reset_day_if_needed()
+    store = StateStore(settings)
 
-            process_telegram()
+    broker = PaperBroker(
+        settings,
+        store,
+    )
 
+    market = MarketDataClient(settings)
+    strategy = Strategy(settings)
 
-            current = time.time()
+    engine = ResearchEngine(
+        settings,
+        market,
+        strategy,
+        broker,
+        store,
+    )
 
+    telegram_interface = TelegramInterface(
+        settings,
+        engine,
+        broker,
+    )
 
-            # --------------------------------
-            # Update open positions
-            # --------------------------------
+    health_server = HealthServer(
+        engine,
+        settings.port,
+    )
 
-            if (
-                current
-                - last_position_time
-                >= POSITION_UPDATE_SECONDS
-            ):
+    application: Application
 
-                update_positions()
+    async def notify(message: str) -> None:
+        await application.bot.send_message(
+            chat_id=settings.telegram_chat_id,
+            text=message,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
 
-                last_position_time = current
+    async def post_init(
+        app: Application,
+    ) -> None:
+        engine.set_notifier(notify)
 
+        await telegram_interface.configure_commands(
+            app
+        )
 
-            # --------------------------------
-            # Scan
-            # --------------------------------
+        await health_server.start()
 
-            if (
-                current
-                - last_scan_time
-                >= SCAN_INTERVAL_SECONDS
-            ):
+        task = asyncio.create_task(
+            engine.run(),
+            name="jarvis-research-engine",
+        )
 
-                scan_market()
+        app.bot_data["engine_task"] = task
 
-                last_scan_time = current
+        await notify(
+            "🤖 <b>JARVIS V2.1 STARTED</b>\n"
+            "Mode: 🧪 <b>PAPER TRADING ONLY</b>\n"
+            "Use /scan to run a visible market scan."
+        )
 
+        LOGGER.info(
+            "Jarvis V2.1 started"
+        )
 
-            # --------------------------------
-            # Periodic status
-            # --------------------------------
+    async def post_shutdown(
+        app: Application,
+    ) -> None:
+        task = app.bot_data.get(
+            "engine_task"
+        )
 
-            if (
-                current
-                - last_status_time
-                >= STATUS_INTERVAL_SECONDS
-            ):
+        if task:
+            task.cancel()
 
-                telegram_send(
-                    status_message()
-                )
-
-                last_status_time = current
-
-
-            time.sleep(2)
-
-
-        except KeyboardInterrupt:
-
-            print(
-                "JARVIS stopped."
+            await asyncio.gather(
+                task,
+                return_exceptions=True,
             )
 
-            break
+        await engine.stop()
+        await health_server.stop()
 
+    application = (
+        telegram_interface.create_application(
+            post_init=post_init,
+            post_shutdown=post_shutdown,
+        )
+    )
 
-        except Exception as e:
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        close_loop=True,
+    )
 
-            print(
-                "Main loop error:",
-                e
-            )
-
-            traceback.print_exc()
-
-            time.sleep(10)
-
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
     main()
