@@ -168,10 +168,10 @@ class Settings:
             observation_seconds=_env_int("OBSERVATION_SECONDS", 120, 30),
             candidate_ttl_seconds=_env_int("CANDIDATE_TTL_SECONDS", 15 * 60, 60),
             dex_retry_seconds=_env_int("DEX_RETRY_SECONDS", 30, 5),
-            min_liquidity_usd=_env_float("MIN_LIQUIDITY_USD", 10_000.0, 0.0),
-            min_market_cap_usd=_env_float("MIN_MARKET_CAP_USD", 15_000.0, 0.0),
+            min_liquidity_usd=_env_float("MIN_LIQUIDITY_USD", 4_000.0, 0.0),
+            min_market_cap_usd=_env_float("MIN_MARKET_CAP_USD", 8_000.0, 0.0),
             max_market_cap_usd=_env_float("MAX_MARKET_CAP_USD", 1_500_000.0, 1.0),
-            min_volume_5m_usd=_env_float("MIN_VOLUME_5M_USD", 3_000.0, 0.0),
+            min_volume_5m_usd=_env_float("MIN_VOLUME_5M_USD", 1_500.0, 0.0),
             min_buys_5m=_env_int("MIN_BUYS_5M", 10, 0),
             min_buy_sell_ratio=_env_float("MIN_BUY_SELL_RATIO", 1.2, 0.0),
             min_price_change_5m_pct=_env_float("MIN_PRICE_CHANGE_5M_PCT", -15.0),
@@ -327,6 +327,7 @@ class ScoreResult:
     code: str
     summary: str
     breakdown: dict[str, float] = dataclasses.field(default_factory=dict)
+    metrics: dict[str, float] = dataclasses.field(default_factory=dict)
 
 
 def _linear(value: float, low: float, high: float, points: float) -> float:
@@ -356,29 +357,68 @@ def _momentum_score(change: float, settings: Settings) -> float:
     return max(0.0, 10.0 - penalty)
 
 
+# Rejections that can never improve with time -> drop the candidate.
+# Everything else is a "not yet" and gets re-checked until the TTL expires.
+TERMINAL_REJECT_CODES = frozenset({"high_market_cap"})
+
+
 def score_candidate(
     candidate: Candidate,
     pair: PairData,
     settings: Settings = SETTINGS,
 ) -> ScoreResult:
     if pair.price_usd <= 0:
-        return ScoreResult(0, False, "invalid_price", "no usable USD price")
+        return ScoreResult(
+            0, False, "invalid_price", "no usable USD price",
+            metrics={"price_usd": pair.price_usd},
+        )
     if pair.liquidity_usd < settings.min_liquidity_usd:
-        return ScoreResult(0, False, "low_liquidity", "liquidity below minimum")
+        return ScoreResult(
+            0, False, "low_liquidity",
+            f"liquidity {money(pair.liquidity_usd)} below minimum",
+            metrics={"liquidity_usd": pair.liquidity_usd},
+        )
     if pair.market_cap_usd < settings.min_market_cap_usd:
-        return ScoreResult(0, False, "low_market_cap", "market cap below minimum")
+        return ScoreResult(
+            0, False, "low_market_cap",
+            f"market cap {money(pair.market_cap_usd)} below minimum",
+            metrics={"market_cap_usd": pair.market_cap_usd},
+        )
     if pair.market_cap_usd > settings.max_market_cap_usd:
-        return ScoreResult(0, False, "high_market_cap", "market cap above maximum")
+        return ScoreResult(
+            0, False, "high_market_cap",
+            f"market cap {money(pair.market_cap_usd)} above maximum",
+            metrics={"market_cap_usd": pair.market_cap_usd},
+        )
     if pair.volume_5m_usd < settings.min_volume_5m_usd:
-        return ScoreResult(0, False, "low_volume", "5-minute volume below minimum")
+        return ScoreResult(
+            0, False, "low_volume",
+            f"5m volume {money(pair.volume_5m_usd)} below minimum",
+            metrics={"volume_5m_usd": pair.volume_5m_usd},
+        )
     if pair.buys_5m < settings.min_buys_5m:
-        return ScoreResult(0, False, "low_buys", "too few 5-minute buys")
+        return ScoreResult(
+            0, False, "low_buys", f"only {pair.buys_5m} buys in 5m",
+            metrics={"buys_5m": float(pair.buys_5m)},
+        )
     if pair.buy_sell_ratio_5m < settings.min_buy_sell_ratio:
-        return ScoreResult(0, False, "weak_buy_pressure", "buy/sell ratio too low")
+        return ScoreResult(
+            0, False, "weak_buy_pressure",
+            f"buy/sell {pair.buy_sell_ratio_5m:.2f} too low",
+            metrics={"buy_sell_ratio_5m": pair.buy_sell_ratio_5m},
+        )
     if pair.price_change_5m_pct < settings.min_price_change_5m_pct:
-        return ScoreResult(0, False, "falling_fast", "5-minute momentum too negative")
+        return ScoreResult(
+            0, False, "falling_fast",
+            f"5m move {pair.price_change_5m_pct:+.1f}% too negative",
+            metrics={"price_change_5m_pct": pair.price_change_5m_pct},
+        )
     if pair.price_change_5m_pct > settings.max_price_change_5m_pct:
-        return ScoreResult(0, False, "chasing_spike", "5-minute move is too extended")
+        return ScoreResult(
+            0, False, "chasing_spike",
+            f"5m move {pair.price_change_5m_pct:+.1f}% too extended",
+            metrics={"price_change_5m_pct": pair.price_change_5m_pct},
+        )
 
     breakdown = {
         "liquidity": _linear(
@@ -414,6 +454,7 @@ def score_candidate(
         "passed" if passed else "low_score",
         summary,
         {key: round(value, 2) for key, value in breakdown.items()},
+        metrics={"score": float(total)},
     )
 
 
@@ -1084,6 +1125,9 @@ class TradingEngine:
         self.scanner: PumpScanner | None = None
         self.candidates: dict[str, Candidate] = {}
         self.funnel: Counter[str] = Counter()
+        # Rolling window of recent rejections with the value that failed, so
+        # /rejects can show where the thresholds actually sit.
+        self.reject_log: deque[dict[str, Any]] = deque(maxlen=3000)
 
     def attach_scanner(self, scanner: PumpScanner) -> None:
         self.scanner = scanner
@@ -1161,8 +1205,16 @@ class TradingEngine:
             result = score_candidate(candidate, pair, self.settings)
             if not result.passed:
                 self.funnel[f"reject_{result.code}"] += 1
+                self._record_reject(candidate, result)
                 log.info("reject %s | %s", candidate.symbol, result.summary)
-                await self._remove_candidate(candidate.mint)
+                if result.code in TERMINAL_REJECT_CODES:
+                    await self._remove_candidate(candidate.mint)
+                else:
+                    # A brand-new pool that is thin RIGHT NOW may be tradeable in
+                    # two minutes. Keep re-checking until the candidate TTL ends
+                    # instead of discarding it on the first look.
+                    candidate.next_check_at = now + self.settings.dex_retry_seconds
+                    self.funnel["recheck_scheduled"] += 1
                 continue
 
             allowed, reason = self.account.can_open()
@@ -1325,6 +1377,61 @@ class TradingEngine:
         ordered = sorted(self.funnel.items(), key=lambda item: item[0])
         return "\n".join(f"• {name}: {count}" for name, count in ordered)
 
+    def _record_reject(self, candidate: Candidate, result: ScoreResult) -> None:
+        self.reject_log.append(
+            {
+                "code": result.code,
+                "symbol": candidate.symbol,
+                "summary": result.summary,
+                "metrics": dict(result.metrics),
+            }
+        )
+
+    def reject_summary(self) -> str:
+        """Show the distribution of the values that failed each filter.
+
+        The point is to answer 'is my threshold slightly too tight, or wildly
+        off?' — a median liquidity of $8k means lower the bar a little, $300
+        means these tokens were never tradeable.
+        """
+        if not self.reject_log:
+            return "No rejections recorded yet."
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in self.reject_log:
+            grouped.setdefault(row["code"], []).append(row)
+
+        thresholds = {
+            "liquidity_usd": self.settings.min_liquidity_usd,
+            "volume_5m_usd": self.settings.min_volume_5m_usd,
+            "market_cap_usd": self.settings.max_market_cap_usd,
+            "buys_5m": float(self.settings.min_buys_5m),
+            "buy_sell_ratio_5m": self.settings.min_buy_sell_ratio,
+            "price_change_5m_pct": self.settings.max_price_change_5m_pct,
+            "score": float(self.settings.min_score),
+        }
+
+        lines = [f"(last {len(self.reject_log)} rejections)"]
+        for code, rows in sorted(grouped.items(), key=lambda kv: -len(kv[1])):
+            lines.append(f"\n• {code}: {len(rows)}")
+            keys = {key for row in rows for key in row["metrics"]}
+            for key in sorted(keys):
+                values = sorted(
+                    float(row["metrics"][key]) for row in rows if key in row["metrics"]
+                )
+                if not values:
+                    continue
+                median = values[len(values) // 2]
+                p90 = values[min(len(values) - 1, int(len(values) * 0.9))]
+                limit = thresholds.get(key)
+                limit_text = f" | limit {limit:,.2f}" if limit is not None else ""
+                lines.append(
+                    f"    {key}: median {median:,.2f} | p90 {p90:,.2f}{limit_text}"
+                )
+            for row in rows[:2]:
+                lines.append(f"    e.g. {row['symbol']}: {row['summary']}")
+        return "\n".join(lines)
+
 
 # ======================================================================================
 # TELEGRAM CONTROLLER AND APP LIFECYCLE
@@ -1473,6 +1580,16 @@ class JarvisBot:
             "🔎 SCANNER FUNNEL\n\n" + self.engine.funnel_summary()
         )
 
+    async def cmd_rejects(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not await self._authorized(update):
+            return
+        text = "📉 REJECT DETAIL\n\n" + self.engine.reject_summary()
+        # Telegram caps messages at 4096 characters.
+        for chunk in (text[i : i + 3900] for i in range(0, len(text), 3900)):
+            await update.effective_message.reply_text(chunk)
+
     async def cmd_settings(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -1530,6 +1647,7 @@ class JarvisBot:
             "/positions — open paper positions\n"
             "/sources — live feed health\n"
             "/funnel — exact rejection counts\n"
+            "/rejects — failing values vs your thresholds\n"
             "/settings — active risk/filter values\n"
             "/pause — stop new entries; keep managing exits\n"
             "/resume — allow new entries again\n\n"
@@ -1552,6 +1670,7 @@ class JarvisBot:
             "positions": self.cmd_positions,
             "sources": self.cmd_sources,
             "funnel": self.cmd_funnel,
+            "rejects": self.cmd_rejects,
             "settings": self.cmd_settings,
             "pause": self.cmd_pause,
             "resume": self.cmd_resume,
@@ -1612,6 +1731,7 @@ class JarvisBot:
                 BotCommand("positions", "Open paper positions"),
                 BotCommand("sources", "Data source health"),
                 BotCommand("funnel", "Scanner rejection counts"),
+                BotCommand("rejects", "Why candidates failed, with numbers"),
                 BotCommand("settings", "Active settings"),
                 BotCommand("pause", "Pause new entries"),
                 BotCommand("resume", "Resume new entries"),
