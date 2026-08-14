@@ -1,0 +1,13 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "RAILPACK"
+  },
+  "deploy": {
+    "startCommand": "python -u BOT.py",
+    "restartPolicyType": "ALWAYS",
+    "restartPolicyMaxRetries": 10,
+    "overlapSeconds": "0",
+    "drainingSeconds": "15"
+  }
+}
