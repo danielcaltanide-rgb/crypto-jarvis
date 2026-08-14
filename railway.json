@@ -7,7 +7,7 @@
     "startCommand": "python -u BOT.py",
     "restartPolicyType": "ALWAYS",
     "restartPolicyMaxRetries": 10,
-    "overlapSeconds": "0",
-    "drainingSeconds": "15"
+    "overlapSeconds": 0,
+    "drainingSeconds": 15
   }
 }
