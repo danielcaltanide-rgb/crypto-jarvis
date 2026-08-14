@@ -112,6 +112,7 @@ class Settings:
     candidate_ttl_seconds: int
     dex_retry_seconds: int
     min_liquidity_usd: float
+    liquidity_drain_exit_pct: float
     min_market_cap_usd: float
     max_market_cap_usd: float
     min_volume_5m_usd: float
@@ -152,10 +153,10 @@ class Settings:
             daily_profit_target_usd=_env_float("DAILY_PROFIT_TARGET_USD", 150.0, 0.0),
             stop_after_daily_target=_env_bool("STOP_AFTER_DAILY_TARGET", False),
             risk_per_trade_pct=_env_float("RISK_PER_TRADE_PCT", 0.5, 0.01),
-            max_position_pct=_env_float("MAX_POSITION_PCT", 15.0, 0.1),
+            max_position_pct=_env_float("MAX_POSITION_PCT", 1.5, 0.1),
             max_open_positions=_env_int("MAX_OPEN_POSITIONS", 3, 1),
             max_entries_per_day=_env_int("MAX_ENTRIES_PER_DAY", 10, 1),
-            max_daily_loss_pct=_env_float("MAX_DAILY_LOSS_PCT", 2.0, 0.1),
+            max_daily_loss_pct=_env_float("MAX_DAILY_LOSS_PCT", 5.0, 0.1),
             max_consecutive_losses=_env_int("MAX_CONSECUTIVE_LOSSES", 3, 1),
             stop_loss_pct=_env_float("STOP_LOSS_PCT", 10.0, 0.1),
             tp1_pct=_env_float("TP1_PCT", 18.0, 0.1),
@@ -169,6 +170,9 @@ class Settings:
             candidate_ttl_seconds=_env_int("CANDIDATE_TTL_SECONDS", 15 * 60, 60),
             dex_retry_seconds=_env_int("DEX_RETRY_SECONDS", 30, 5),
             min_liquidity_usd=_env_float("MIN_LIQUIDITY_USD", 4_000.0, 0.0),
+            liquidity_drain_exit_pct=_env_float(
+                "LIQUIDITY_DRAIN_EXIT_PCT", 45.0, 0.0
+            ),
             min_market_cap_usd=_env_float("MIN_MARKET_CAP_USD", 8_000.0, 0.0),
             max_market_cap_usd=_env_float("MAX_MARKET_CAP_USD", 1_500_000.0, 1.0),
             min_volume_5m_usd=_env_float("MIN_VOLUME_5M_USD", 1_500.0, 0.0),
@@ -490,6 +494,7 @@ class Position:
     last_price: float = 0.0
     last_quote_at: float = 0.0
     stale_alert_sent: bool = False
+    entry_liquidity_usd: float = 0.0
 
     def return_pct(self, observed_price: float) -> float:
         if self.entry_fill_price <= 0:
@@ -674,6 +679,7 @@ class PaperAccount:
             tp2_price=fill_price * (1.0 + self.settings.tp2_pct / 100.0),
             peak_price=pair.price_usd,
             score=score,
+            entry_liquidity_usd=pair.liquidity_usd,
             last_price=pair.price_usd,
             last_quote_at=time.time(),
         )
@@ -1289,6 +1295,20 @@ class TradingEngine:
             position.peak_price = max(position.peak_price, price)
             hold_seconds = now - position.opened_at
 
+            drain_limit = self.settings.liquidity_drain_exit_pct / 100.0
+            if (
+                drain_limit > 0
+                and position.entry_liquidity_usd > 0
+                and pair.liquidity_usd
+                < position.entry_liquidity_usd * (1.0 - drain_limit)
+            ):
+                # The pool is being pulled. Exit now rather than waiting for the
+                # price stop, which on a rug fills at effectively zero.
+                await self._close_and_notify(
+                    position, price, 1.0, "liquidity drain"
+                )
+                continue
+
             if price <= position.stop_price:
                 await self._close_and_notify(position, price, 1.0, "stop loss")
                 continue
@@ -1608,6 +1628,8 @@ class JarvisBot:
             f"Paper slippage: {s.paper_slippage_bps:.0f} bps/side\n"
             f"Paper fees: {s.paper_fee_bps:.0f} bps/side\n"
             f"Min score: {s.min_score}/100\n"
+            f"Max position: {s.max_position_pct:.2f}% of equity\n"
+            f"Liquidity-drain exit: -{s.liquidity_drain_exit_pct:.0f}%\n"
             f"Min liquidity: {money(s.min_liquidity_usd)}\n"
             f"Min 5m volume: {money(s.min_volume_5m_usd)}"
         )
