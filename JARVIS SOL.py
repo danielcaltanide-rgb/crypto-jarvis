@@ -43,6 +43,12 @@ from websockets.exceptions import ConnectionClosed
 # CONFIGURATION
 # ======================================================================================
 
+# Auto-restart policy for the background loops. A crashed loop is restarted
+# rather than shutting the bot down, so JARVIS stays online non-stop.
+RESTART_BACKOFF_MIN_SECONDS = 5.0
+RESTART_BACKOFF_MAX_SECONDS = 300.0
+RESTART_HEALTHY_SECONDS = 120.0
+
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
@@ -54,6 +60,16 @@ def _env_bool(name: str, default: bool) -> bool:
     if value in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be true or false")
+
+
+def limit_label(value: float, suffix: str = "") -> str:
+    """Render a configured limit. Zero means the gate is switched off."""
+
+    if not value:
+        return "off"
+    if float(value).is_integer():
+        return f"{int(value)}{suffix}"
+    return f"{value:g}{suffix}"
 
 
 def _env_int(name: str, default: int, minimum: int | None = None) -> int:
@@ -174,9 +190,11 @@ class Settings:
             risk_per_trade_pct=_env_float("RISK_PER_TRADE_PCT", 0.5, 0.01),
             max_position_pct=_env_float("MAX_POSITION_PCT", 1.5, 0.1),
             max_open_positions=_env_int("MAX_OPEN_POSITIONS", 3, 1),
-            max_entries_per_day=_env_int("MAX_ENTRIES_PER_DAY", 10, 1),
-            max_daily_loss_pct=_env_float("MAX_DAILY_LOSS_PCT", 5.0, 0.1),
-            max_consecutive_losses=_env_int("MAX_CONSECUTIVE_LOSSES", 3, 1),
+            # Non-stop defaults: 0 means the gate is disabled entirely.
+            # Set any of these above 0 to switch the brake back on.
+            max_entries_per_day=_env_int("MAX_ENTRIES_PER_DAY", 0, 0),
+            max_daily_loss_pct=_env_float("MAX_DAILY_LOSS_PCT", 0.0, 0.0),
+            max_consecutive_losses=_env_int("MAX_CONSECUTIVE_LOSSES", 0, 0),
             stop_loss_pct=_env_float("STOP_LOSS_PCT", 10.0, 0.1),
             tp1_pct=_env_float("TP1_PCT", 18.0, 0.1),
             tp1_sell_fraction_pct=_env_float("TP1_SELL_FRACTION_PCT", 50.0, 1.0),
@@ -894,13 +912,23 @@ class PaperAccount:
             return False, "manually paused"
         if len(self.open_positions) >= self.settings.max_open_positions:
             return False, "max_open_positions"
-        if self.daily.entries >= self.settings.max_entries_per_day:
+        # Each limit below is skipped when set to 0, so the bot keeps trading.
+        if (
+            self.settings.max_entries_per_day
+            and self.daily.entries >= self.settings.max_entries_per_day
+        ):
             return False, "max_daily_entries"
-        if self.daily.consecutive_losses >= self.settings.max_consecutive_losses:
+        if (
+            self.settings.max_consecutive_losses
+            and self.daily.consecutive_losses >= self.settings.max_consecutive_losses
+        ):
             return False, "loss_streak_limit"
-        loss_limit = self.daily.start_equity * self.settings.max_daily_loss_pct / 100.0
-        if self.daily_pnl() <= -loss_limit:
-            return False, "daily_loss_limit"
+        if self.settings.max_daily_loss_pct:
+            loss_limit = (
+                self.daily.start_equity * self.settings.max_daily_loss_pct / 100.0
+            )
+            if self.daily_pnl() <= -loss_limit:
+                return False, "daily_loss_limit"
         if (
             self.settings.stop_after_daily_target
             and self.daily_pnl() >= self.settings.daily_profit_target_usd
@@ -1976,7 +2004,8 @@ class JarvisBot:
             f"Total realized P/L: {money(self.account.total_realized_pnl)}\n"
             f"Today P/L: {money(self.account.daily_pnl())}\n"
             f"Open: {len(self.account.open_positions)}/{self.settings.max_open_positions}\n"
-            f"Entries today: {self.account.daily.entries}/{self.settings.max_entries_per_day}\n"
+            f"Entries today: {self.account.daily.entries}/"
+            f"{limit_label(self.settings.max_entries_per_day)}\n"
             f"W/L: {self.account.total_wins}/{self.account.total_losses}\n"
             f"Win rate: {self.account.win_rate():.1f}%\n"
             f"Candidates waiting: {len(self.engine.candidates)}\n"
@@ -1998,10 +2027,11 @@ class JarvisBot:
             f"Realized: {money(self.account.daily.realized_pnl)}\n"
             f"Reference target: {money(target)}\n"
             f"Progress: {progress:.0f}%\n"
-            f"Entries: {self.account.daily.entries}/{self.settings.max_entries_per_day}\n"
+            f"Entries: {self.account.daily.entries}/"
+            f"{limit_label(self.settings.max_entries_per_day)}\n"
             f"W/L: {self.account.daily.wins}/{self.account.daily.losses}\n"
             f"Loss streak: {self.account.daily.consecutive_losses}/"
-            f"{self.settings.max_consecutive_losses}"
+            f"{limit_label(self.settings.max_consecutive_losses)}"
         )
 
     async def cmd_positions(
@@ -2154,7 +2184,9 @@ class JarvisBot:
             "⚙️ ACTIVE SETTINGS\n\n"
             f"Risk/trade: {s.risk_per_trade_pct:.2f}%\n"
             f"Max allocation: {s.max_position_pct:.1f}%\n"
-            f"Daily loss limit: {s.max_daily_loss_pct:.1f}%\n"
+            f"Daily loss limit: {limit_label(s.max_daily_loss_pct, '%')}\n"
+            f"Daily entry limit: {limit_label(s.max_entries_per_day)}\n"
+            f"Loss streak limit: {limit_label(s.max_consecutive_losses)}\n"
             f"Stop: -{s.stop_loss_pct:.1f}%\n"
             f"TP1: +{s.tp1_pct:.1f}% (sell {s.tp1_sell_fraction_pct:.0f}%)\n"
             f"TP2: +{s.tp2_pct:.1f}%\n"
@@ -2264,13 +2296,46 @@ class JarvisBot:
                 self.dex.summary(),
             )
 
+    async def _supervise(
+        self, name: str, factory: Callable[[], Awaitable[None]]
+    ) -> None:
+        """Keep a background loop alive forever, restarting it on any error."""
+
+        backoff = RESTART_BACKOFF_MIN_SECONDS
+        while not self.stop_event.is_set():
+            started = time.time()
+            try:
+                await factory()
+                log.warning("background task %s returned; restarting", name)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error(
+                    "background task %s crashed; restarting in %.0fs",
+                    name,
+                    backoff,
+                    exc_info=exc,
+                )
+                with contextlib.suppress(Exception):
+                    await self.notify(
+                        f"♻️ <b>{name}</b> hit an error and restarts in "
+                        f"{backoff:.0f}s.\nBot stays online."
+                    )
+            # A long clean run means the failure was transient, so reset backoff.
+            if time.time() - started >= RESTART_HEALTHY_SECONDS:
+                backoff = RESTART_BACKOFF_MIN_SECONDS
+            else:
+                backoff = min(backoff * 2, RESTART_BACKOFF_MAX_SECONDS)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.stop_event.wait(), timeout=backoff)
+
     def _task_done(self, task: asyncio.Task) -> None:
+        # Supervised tasks never end on their own, so only log if one does.
         if task.cancelled():
             return
         exception = task.exception()
         if exception:
-            log.error("background task %s stopped", task.get_name(), exc_info=exception)
-            self.stop_event.set()
+            log.error("supervisor %s stopped", task.get_name(), exc_info=exception)
 
     async def run(self) -> None:
         self.app = (
@@ -2306,12 +2371,22 @@ class JarvisBot:
         )
 
         self.background_tasks = [
-            asyncio.create_task(self.scanner.run(), name="pumpportal-scanner"),
             asyncio.create_task(
-                self.engine.evaluator_loop(), name="candidate-evaluator"
+                self._supervise("pumpportal-scanner", self.scanner.run),
+                name="pumpportal-scanner",
             ),
-            asyncio.create_task(self.engine.monitor_loop(), name="position-monitor"),
-            asyncio.create_task(self.heartbeat_loop(), name="heartbeat"),
+            asyncio.create_task(
+                self._supervise("candidate-evaluator", self.engine.evaluator_loop),
+                name="candidate-evaluator",
+            ),
+            asyncio.create_task(
+                self._supervise("position-monitor", self.engine.monitor_loop),
+                name="position-monitor",
+            ),
+            asyncio.create_task(
+                self._supervise("heartbeat", self.heartbeat_loop),
+                name="heartbeat",
+            ),
         ]
         for task in self.background_tasks:
             task.add_done_callback(self._task_done)
@@ -2328,6 +2403,7 @@ class JarvisBot:
         )
         await self.notify(
             "🤖 <b>JARVIS SOL v2 STARTED</b>\n"
+            "Mode: ♾️ NON-STOP\n"
             "Mode: 🧪 PAPER ONLY\n"
             f"Equity: {money(self.account.equity())}\n"
             f"Restored positions: {len(self.account.open_positions)}"
