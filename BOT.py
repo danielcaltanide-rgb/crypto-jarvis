@@ -113,6 +113,15 @@ class Settings:
     dex_retry_seconds: int
     min_liquidity_usd: float
     liquidity_drain_exit_pct: float
+    enable_wallet_tracking: bool
+    whale_min_sol: float
+    whale_buys_to_track: int
+    tracked_wallets_file: Path
+    smart_money_window_seconds: int
+    smart_money_score_bonus: float
+    smart_money_skip_observation: bool
+    min_liquidity_to_mcap_pct: float
+    min_pool_age_seconds: int
     min_market_cap_usd: float
     max_market_cap_usd: float
     min_volume_5m_usd: float
@@ -173,6 +182,23 @@ class Settings:
             liquidity_drain_exit_pct=_env_float(
                 "LIQUIDITY_DRAIN_EXIT_PCT", 45.0, 0.0
             ),
+            enable_wallet_tracking=_env_bool("ENABLE_WALLET_TRACKING", False),
+            whale_min_sol=_env_float("WHALE_MIN_SOL", 2.0, 0.01),
+            whale_buys_to_track=_env_int("WHALE_BUYS_TO_TRACK", 3, 1),
+            tracked_wallets_file=Path(
+                os.getenv("TRACKED_WALLETS_FILE", "/data/tracked_wallets.json")
+            ),
+            smart_money_window_seconds=_env_int(
+                "SMART_MONEY_WINDOW_SECONDS", 600, 60
+            ),
+            smart_money_score_bonus=_env_float("SMART_MONEY_SCORE_BONUS", 12.0, 0.0),
+            smart_money_skip_observation=_env_bool(
+                "SMART_MONEY_SKIP_OBSERVATION", True
+            ),
+            min_liquidity_to_mcap_pct=_env_float(
+                "MIN_LIQUIDITY_TO_MCAP_PCT", 4.0, 0.0
+            ),
+            min_pool_age_seconds=_env_int("MIN_POOL_AGE_SECONDS", 180, 0),
             min_market_cap_usd=_env_float("MIN_MARKET_CAP_USD", 8_000.0, 0.0),
             max_market_cap_usd=_env_float("MAX_MARKET_CAP_USD", 1_500_000.0, 1.0),
             min_volume_5m_usd=_env_float("MIN_VOLUME_5M_USD", 1_500.0, 0.0),
@@ -370,6 +396,7 @@ def score_candidate(
     candidate: Candidate,
     pair: PairData,
     settings: Settings = SETTINGS,
+    smart_buyers: int = 0,
 ) -> ScoreResult:
     if pair.price_usd <= 0:
         return ScoreResult(
@@ -382,6 +409,24 @@ def score_candidate(
             f"liquidity {money(pair.liquidity_usd)} below minimum",
             metrics={"liquidity_usd": pair.liquidity_usd},
         )
+    pool_age = time.time() - pair.pair_created_at / 1000.0 if pair.pair_created_at else 0.0
+    if settings.min_pool_age_seconds and 0 < pool_age < settings.min_pool_age_seconds:
+        # Buying in the first seconds is the sniper lane; we cannot win it, and
+        # it is where the instant rugs live.
+        return ScoreResult(
+            0, False, "pool_too_new", f"pool only {pool_age:.0f}s old",
+            metrics={"pool_age_seconds": pool_age},
+        )
+    if pair.market_cap_usd > 0 and settings.min_liquidity_to_mcap_pct > 0:
+        liq_ratio = 100.0 * pair.liquidity_usd / pair.market_cap_usd
+        if liq_ratio < settings.min_liquidity_to_mcap_pct:
+            # A big cap sitting on a thin pool cannot be exited at anything
+            # near the quoted price.
+            return ScoreResult(
+                0, False, "thin_pool_vs_mcap",
+                f"liquidity is only {liq_ratio:.1f}% of market cap",
+                metrics={"liquidity_to_mcap_pct": liq_ratio},
+            )
     if pair.market_cap_usd < settings.min_market_cap_usd:
         return ScoreResult(
             0, False, "low_market_cap",
@@ -444,6 +489,12 @@ def score_candidate(
         # A small corroboration bonus only; the official DEX metrics still carry
         # the decision so a WebSocket gap cannot manufacture a false pass.
         breakdown["unique_buyers_bonus"] = _linear(unique_buyers, 3, 20, 5.0)
+
+    if smart_buyers > 0 and settings.smart_money_score_bonus > 0:
+        breakdown["smart_money"] = min(
+            settings.smart_money_score_bonus,
+            settings.smart_money_score_bonus * smart_buyers / 2.0,
+        )
 
     total = min(100, round(sum(breakdown.values())))
     passed = total >= settings.min_score
@@ -988,6 +1039,102 @@ class DexScreenerClient:
 # ======================================================================================
 
 
+class WalletTracker:
+    """Watchlist of Solana wallets plus the tokens they just bought.
+
+    A wallet only earns a place here by its own on-chain record. Tracking is
+    a signal, never a guarantee: a tracked wallet can be exiting into you.
+    """
+
+    def __init__(self, settings: Settings = SETTINGS):
+        self.settings = settings
+        self.wallets: dict[str, str] = {}          # address -> label
+        self.recent_buys: dict[str, list[tuple[float, str]]] = {}  # mint -> hits
+        self.whale_hits: deque[tuple[float, str, str, float]] = deque(maxlen=500)
+        self.whale_buy_counts: Counter[str] = Counter()
+        self.load()
+
+    def load(self) -> None:
+        path = self.settings.tracked_wallets_file
+        try:
+            if path.exists():
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    self.wallets = {
+                        str(k): str(v) for k, v in raw.get("wallets", {}).items()
+                    }
+        except (OSError, json.JSONDecodeError) as error:
+            log.warning("could not read tracked wallets: %s", error)
+
+    def save(self) -> None:
+        path = self.settings.tracked_wallets_file
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps({"wallets": self.wallets}, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        except OSError as error:
+            log.warning("could not save tracked wallets: %s", error)
+
+    def add(self, address: str, label: str = "") -> bool:
+        address = address.strip()
+        if not (32 <= len(address) <= 44):
+            return False
+        self.wallets[address] = label.strip() or "unlabelled"
+        self.save()
+        return True
+
+    def remove(self, address: str) -> bool:
+        if address.strip() in self.wallets:
+            del self.wallets[address.strip()]
+            self.save()
+            return True
+        return False
+
+    def record_whale_buy(self, mint: str, wallet: str, sol_amount: float) -> None:
+        """A large buy on a token we are already watching.
+
+        Size is a proxy for conviction, not for skill — plenty of large buys
+        are the token's own team cycling their capital back through the pool.
+        """
+        self.record_buy(mint, wallet)
+        self.whale_hits.append((time.time(), mint, wallet, sol_amount))
+        seen = self.whale_buy_counts.get(wallet, 0) + 1
+        self.whale_buy_counts[wallet] = seen
+        if seen >= self.settings.whale_buys_to_track and wallet not in self.wallets:
+            self.add(wallet, f"auto: {seen} large buys")
+            log.info("auto-tracking repeat whale %s", wallet)
+
+    def recent_whales(self, limit: int = 15) -> list[tuple[float, str, str, float]]:
+        cutoff = time.time() - self.settings.smart_money_window_seconds
+        rows = [hit for hit in self.whale_hits if hit[0] >= cutoff]
+        return sorted(rows, key=lambda hit: -hit[3])[:limit]
+
+    def record_buy(self, mint: str, wallet: str) -> None:
+        hits = self.recent_buys.setdefault(mint, [])
+        hits.append((time.time(), wallet))
+        if len(hits) > 50:
+            del hits[:-50]
+
+    def buyers_of(self, mint: str) -> list[str]:
+        """Distinct tracked wallets that bought this mint inside the window."""
+        cutoff = time.time() - self.settings.smart_money_window_seconds
+        hits = self.recent_buys.get(mint, [])
+        return sorted({wallet for stamp, wallet in hits if stamp >= cutoff})
+
+    def prune(self) -> None:
+        cutoff = time.time() - self.settings.smart_money_window_seconds
+        for mint in list(self.recent_buys):
+            kept = [hit for hit in self.recent_buys[mint] if hit[0] >= cutoff]
+            if kept:
+                self.recent_buys[mint] = kept
+            else:
+                del self.recent_buys[mint]
+
+
 class PumpScanner:
     BASE_URL = "wss://pumpportal.fun/api/data"
 
@@ -1129,6 +1276,7 @@ class TradingEngine:
         self.dex = dex
         self.notify = notify
         self.scanner: PumpScanner | None = None
+        self.tracker = WalletTracker(settings)
         self.candidates: dict[str, Candidate] = {}
         self.funnel: Counter[str] = Counter()
         # Rolling window of recent rejections with the value that failed, so
@@ -1165,12 +1313,36 @@ class TradingEngine:
         log.info("new token %s (%s) | %s", candidate.name, candidate.symbol, mint)
 
     async def on_trade(self, message: dict[str, Any]) -> None:
-        candidate = self.candidates.get(str(message.get("mint") or ""))
+        mint = str(message.get("mint") or "")
+        side = str(message.get("txType") or "")
+        trader = str(message.get("traderPublicKey") or "unknown")
+        candidate = self.candidates.get(mint)
         if candidate:
-            candidate.record_trade(
-                str(message.get("txType") or ""),
-                str(message.get("traderPublicKey") or "unknown"),
-            )
+            candidate.record_trade(side, trader)
+
+        if side != "buy" or not mint:
+            return
+
+        sol_amount = safe_float(
+            message.get("solAmount") or message.get("sol_amount") or 0.0
+        )
+        is_whale = sol_amount >= self.settings.whale_min_sol
+        is_tracked = trader in self.tracker.wallets
+
+        if is_whale:
+            self.tracker.record_whale_buy(mint, trader, sol_amount)
+            self.funnel["whale_buys_seen"] += 1
+        elif is_tracked:
+            self.tracker.record_buy(mint, trader)
+
+        if not (is_whale or is_tracked):
+            return
+
+        self.funnel["smart_money_hits"] += 1
+        # Bring the candidate forward so the DEX check happens now rather than
+        # after the full observation delay.
+        if candidate and self.settings.smart_money_skip_observation:
+            candidate.next_check_at = min(candidate.next_check_at, time.time())
 
     async def evaluator_loop(self) -> None:
         while True:
@@ -1184,6 +1356,7 @@ class TradingEngine:
 
     async def _evaluate_due_candidates(self) -> None:
         now = time.time()
+        self.tracker.prune()
         expired = [
             mint for mint, item in self.candidates.items() if item.expires_at <= now
         ]
@@ -1208,7 +1381,10 @@ class TradingEngine:
                 continue
 
             self.funnel["dex_pool_found"] += 1
-            result = score_candidate(candidate, pair, self.settings)
+            smart_buyers = self.tracker.buyers_of(candidate.mint)
+            result = score_candidate(
+                candidate, pair, self.settings, smart_buyers=len(smart_buyers)
+            )
             if not result.passed:
                 self.funnel[f"reject_{result.code}"] += 1
                 self._record_reject(candidate, result)
@@ -1376,7 +1552,13 @@ class TradingEngine:
             f"TP1: ${position.tp1_price:.10f}\n"
             f"TP2: ${position.tp2_price:.10f}\n\n"
             f"Mint: <code>{html.escape(candidate.mint)}</code>\n"
-            "Mode: 🧪 PAPER ONLY"
+            + (
+                f"🐋 Smart-money buyers in window: "
+                f"{len(self.tracker.buyers_of(candidate.mint))}\n"
+                if self.tracker.buyers_of(candidate.mint)
+                else ""
+            )
+            + "Mode: 🧪 PAPER ONLY"
         )
 
     def _exit_message(self, result: CloseResult) -> str:
@@ -1600,6 +1782,89 @@ class JarvisBot:
             "🔎 SCANNER FUNNEL\n\n" + self.engine.funnel_summary()
         )
 
+    async def cmd_whales(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not await self._authorized(update):
+            return
+        tracker = self.engine.tracker
+        if not self.settings.enable_metered_trade_stream:
+            await update.effective_message.reply_text(
+                "🐋 Whale tracking needs the PumpPortal trade stream.\n"
+                "Set PUMPPORTAL_API_KEY and ENABLE_METERED_TRADE_STREAM=true.\n"
+                "That stream is metered, so it bills per subscription."
+            )
+            return
+        rows = tracker.recent_whales()
+        if not rows:
+            await update.effective_message.reply_text(
+                f"🐋 No buys over {self.settings.whale_min_sol:.2f} SOL "
+                "in the current window."
+            )
+            return
+        lines = [f"🐋 <b>RECENT WHALE BUYS</b> (&gt; {self.settings.whale_min_sol:.2f} SOL)\n"]
+        for stamp, mint, wallet, amount in rows:
+            age = (time.time() - stamp) / 60.0
+            safe_mint = html.escape(mint)
+            lines.append(
+                f"\n<b>{amount:.2f} SOL</b> · {age:.0f}m ago\n"
+                f"<code>{safe_mint}</code>\n"
+                f"Buyer: <code>{html.escape(wallet)}</code>\n"
+                f'<a href="https://dexscreener.com/solana/{safe_mint}">chart</a>'
+            )
+        lines.append(f"\n\nAuto-tracked wallets: {len(tracker.wallets)}")
+        await update.effective_message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+    async def cmd_watch(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not await self._authorized(update):
+            return
+        if not context.args:
+            await update.effective_message.reply_text(
+                "Usage: /watch <wallet address> [label]"
+            )
+            return
+        address = context.args[0]
+        label = " ".join(context.args[1:])
+        if self.engine.tracker.add(address, label):
+            await update.effective_message.reply_text(f"👁 Tracking {address[:8]}…")
+        else:
+            await update.effective_message.reply_text(
+                "That does not look like a Solana address."
+            )
+
+    async def cmd_unwatch(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not await self._authorized(update):
+            return
+        if not context.args:
+            await update.effective_message.reply_text("Usage: /unwatch <wallet address>")
+            return
+        if self.engine.tracker.remove(context.args[0]):
+            await update.effective_message.reply_text("Removed.")
+        else:
+            await update.effective_message.reply_text("That wallet was not tracked.")
+
+    async def cmd_watchlist(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not await self._authorized(update):
+            return
+        wallets = self.engine.tracker.wallets
+        if not wallets:
+            await update.effective_message.reply_text("No wallets tracked yet.")
+            return
+        lines = [f"👁 TRACKED WALLETS ({len(wallets)})\n"]
+        for address, label in sorted(wallets.items(), key=lambda kv: kv[1]):
+            lines.append(f"• {address[:6]}…{address[-4:]} — {label}")
+        await update.effective_message.reply_text("\n".join(lines))
+
     async def cmd_rejects(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -1670,6 +1935,10 @@ class JarvisBot:
             "/sources — live feed health\n"
             "/funnel — exact rejection counts\n"
             "/rejects — failing values vs your thresholds\n"
+            "/whales — recent large buys\n"
+            "/watch <wallet> [label] — track a wallet\n"
+            "/unwatch <wallet> — stop tracking\n"
+            "/watchlist — wallets currently tracked\n"
             "/settings — active risk/filter values\n"
             "/pause — stop new entries; keep managing exits\n"
             "/resume — allow new entries again\n\n"
@@ -1693,6 +1962,10 @@ class JarvisBot:
             "sources": self.cmd_sources,
             "funnel": self.cmd_funnel,
             "rejects": self.cmd_rejects,
+            "whales": self.cmd_whales,
+            "watch": self.cmd_watch,
+            "unwatch": self.cmd_unwatch,
+            "watchlist": self.cmd_watchlist,
             "settings": self.cmd_settings,
             "pause": self.cmd_pause,
             "resume": self.cmd_resume,
@@ -1754,6 +2027,8 @@ class JarvisBot:
                 BotCommand("sources", "Data source health"),
                 BotCommand("funnel", "Scanner rejection counts"),
                 BotCommand("rejects", "Why candidates failed, with numbers"),
+                BotCommand("whales", "Recent large buys on watched tokens"),
+                BotCommand("watchlist", "Wallets being tracked"),
                 BotCommand("settings", "Active settings"),
                 BotCommand("pause", "Pause new entries"),
                 BotCommand("resume", "Resume new entries"),
