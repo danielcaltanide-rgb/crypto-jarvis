@@ -115,6 +115,8 @@ class Settings:
     liquidity_drain_exit_pct: float
     enable_wallet_tracking: bool
     whale_min_sol: float
+    whale_alerts_enabled: bool
+    whale_alert_cooldown_seconds: int
     whale_buys_to_track: int
     tracked_wallets_file: Path
     smart_money_window_seconds: int
@@ -184,6 +186,10 @@ class Settings:
             ),
             enable_wallet_tracking=_env_bool("ENABLE_WALLET_TRACKING", False),
             whale_min_sol=_env_float("WHALE_MIN_SOL", 2.0, 0.01),
+            whale_alerts_enabled=_env_bool("WHALE_ALERTS_ENABLED", True),
+            whale_alert_cooldown_seconds=_env_int(
+                "WHALE_ALERT_COOLDOWN_SECONDS", 120, 0
+            ),
             whale_buys_to_track=_env_int("WHALE_BUYS_TO_TRACK", 3, 1),
             tracked_wallets_file=Path(
                 os.getenv("TRACKED_WALLETS_FILE", "/data/tracked_wallets.json")
@@ -1277,6 +1283,7 @@ class TradingEngine:
         self.notify = notify
         self.scanner: PumpScanner | None = None
         self.tracker = WalletTracker(settings)
+        self.whale_alert_sent_at: dict[str, float] = {}
         self.candidates: dict[str, Candidate] = {}
         self.funnel: Counter[str] = Counter()
         # Rolling window of recent rejections with the value that failed, so
@@ -1332,6 +1339,7 @@ class TradingEngine:
         if is_whale:
             self.tracker.record_whale_buy(mint, trader, sol_amount)
             self.funnel["whale_buys_seen"] += 1
+            await self._maybe_whale_alert(mint, trader, sol_amount, candidate)
         elif is_tracked:
             self.tracker.record_buy(mint, trader)
 
@@ -1343,6 +1351,35 @@ class TradingEngine:
         # after the full observation delay.
         if candidate and self.settings.smart_money_skip_observation:
             candidate.next_check_at = min(candidate.next_check_at, time.time())
+
+    async def _maybe_whale_alert(
+        self,
+        mint: str,
+        wallet: str,
+        sol_amount: float,
+        candidate: Candidate | None,
+    ) -> None:
+        """Push a Telegram alert for a large buy, rate-limited per token."""
+        if not self.settings.whale_alerts_enabled:
+            return
+        now = time.time()
+        last = self.whale_alert_sent_at.get(mint, 0.0)
+        if now - last < self.settings.whale_alert_cooldown_seconds:
+            return
+        self.whale_alert_sent_at[mint] = now
+
+        symbol = candidate.symbol if candidate else "?"
+        buyers = len(self.tracker.buyers_of(mint))
+        safe_mint = html.escape(mint)
+        await self.notify(
+            f"🐋 <b>WHALE BUY — {html.escape(symbol)}</b>\n\n"
+            f"Size: <b>{sol_amount:.2f} SOL</b>\n"
+            f"Buyer: <code>{html.escape(wallet)}</code>\n"
+            f"Tracked buyers on this token: {buyers}\n\n"
+            f"Contract:\n<code>{safe_mint}</code>\n"
+            f'<a href="https://dexscreener.com/solana/{safe_mint}">chart</a>\n\n'
+            "Alert only — no paper entry unless it clears the filters."
+        )
 
     async def evaluator_loop(self) -> None:
         while True:
